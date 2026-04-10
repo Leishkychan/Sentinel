@@ -105,6 +105,11 @@ class ScanResult(BaseModel):
     delta_summary:  Optional[str] = None
     delta_markdown: Optional[str] = None
 
+    # Phase 4 — pipeline + eval
+    pipeline_summary:      dict  = Field(default_factory=dict)
+    negative_validations:  int   = 0
+    eval_run:              Optional[dict] = None
+
 
 # ── Audit Log Entry ───────────────────────────────────────────────────────────
 

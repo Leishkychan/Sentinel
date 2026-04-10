@@ -46,6 +46,10 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     print(f"\n[ORCHESTRATOR] Target={session.target} Mode={session.mode}")
     load_attack_data()
 
+    # Initialize eval harness
+    from sentinel.core.eval_harness import EvalHarness
+    eval_harness = EvalHarness(session.target, session.mode.value)
+
     all_findings: list[Finding] = []
     agents_run:   list[AgentName] = []
     done:         set = set()
@@ -101,6 +105,18 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
                         queue.append(agent)
 
     all_findings = enrich_all(all_findings)
+
+    # Enrich with OWASP standards mapping
+    from sentinel.core.standards import enrich_finding_with_standards
+    for f in all_findings:
+        standards = enrich_finding_with_standards(f.title, f.description or "")
+        if standards.get("control_family") != "Uncategorized":
+            if not f.mitre_tactic or f.mitre_tactic == "Unknown":
+                f.mitre_tactic = standards.get("control_family", f.mitre_tactic)
+            # Append standards reference to description
+            refs = standards.get("formatted_short", "")
+            if refs and refs not in (f.description or ""):
+                f.description = (f.description or "") + f"\n📋 {refs}"
     all_findings = _enrich_intel(all_findings)
     all_findings.extend(_nvd_check(session, all_findings))
 
@@ -128,6 +144,26 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     result.delta_markdown = delta_to_markdown(delta)
 
     result.summary = _summary(result, chains)
+    # Surface pipeline summary if available
+    if hasattr(session, '_pipeline'):
+        p = session._pipeline
+        summary = p.get_summary()
+        print(f"[PIPELINE] Summary: {summary['hypotheses_tested']} tested | "
+              f"{summary['confirmed_findings']} confirmed | "
+              f"{summary['refuted_findings']} refuted | "
+              f"confirmation rate: {summary['confirmation_rate']:.0%}")
+        # Add negative validations count to result
+        result.pipeline_summary = summary
+        result.negative_validations = len(p.refuted)
+
+    # Run eval scoring
+    eval_run = eval_harness.score(result)
+    print(f"\n[EVAL] {eval_run.format_scorecard()}")
+    eval_harness.save_run(eval_run)
+    # Store as dict (Pydantic requires serializable types)
+    import dataclasses
+    result.eval_run = dataclasses.asdict(eval_run) if dataclasses.is_dataclass(eval_run) else {}
+
     print(f"[ORCHESTRATOR] DONE: {result.total} findings | {len(chains)} chains")
     return result
 
@@ -544,11 +580,18 @@ def _summary(result: ScanResult, chains: list) -> str:
         resp = client.messages.create(
             model=MODEL, max_tokens=500, system=SYSTEM,
             messages=[{"role": "user", "content":
-                f"Write 3-5 sentence blue team executive summary.\n"
+                f"Write a 3-5 sentence blue team executive summary.\n"
                 f"Target: {result.target} | Mode: {result.mode} | Total: {result.total}\n"
-                f"Severity: {result.by_severity}\nTop findings:\n{top}\n"
+                f"Severity: {result.by_severity}\n"
+                f"Top findings:\n{top}\n"
                 f"{'Chains:\n'+chain_txt if chain_txt else ''}\n"
-                f"Lead with critical chains. Defensive next steps only."}])
+                f"RULES:\n"
+                f"- Only claim findings that were CONFIRMED by direct HTTP evidence\n"
+                f"- If admin endpoints returned SPA shell (HTML ~75KB), do NOT claim admin access\n"
+                f"- Only use CRITICAL severity for findings with confirmed evidence artifacts\n"
+                f"- Distinguish between CONFIRMED findings and INFERRED conditions\n"
+                f"- Format: 'We confirmed X. We detected conditions for Y (unverified).'\n"
+                f"Lead with confirmed findings. Defensive next steps only."}])
         return resp.content[0].text.strip()
     except Exception:
         return f"Scan complete. {result.total} findings. Review CRITICAL and HIGH items first."

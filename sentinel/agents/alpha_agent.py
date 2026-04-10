@@ -27,9 +27,12 @@ from anthropic import Anthropic
 from sentinel.core.models import (
     ScanMode, AgentName, ScanSession, Finding, Severity,
 )
+from sentinel.core.evidence import probe_with_evidence, EvidenceArtifact
+from sentinel.core.pipeline import FindingPipeline, FindingState, NegativeValidation
 from sentinel.core.scoring import (
-    score_hypothesis, score_finding, calibrate_ai_decision,
-    CVSS_BASELINE, _lookup_cvss, _infer_impact,
+    score_finding, calibrate_ai_decision,
+    FindingStatus, VerificationResult, honest_blast_radius,
+    _lookup_cvss_definition,
 )
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
@@ -192,6 +195,9 @@ class AlphaAgent:
         self.learned_patterns: list[LearnedPattern] = []
         self.failed_paths:     set[str] = set()
         self.completed_paths:  set[str] = set()
+        self.confirmed_evidence: list[dict] = []  # Probes that returned confirmed data
+        self.refuted_paths:    set[str] = set()   # Endpoints confirmed NOT vulnerable
+        self.pipeline:         FindingPipeline = FindingPipeline()  # Formal state machine
         self.defensive_gaps:   list[dict] = []
         self.exploit_probs:    list[dict] = []
         self.threat_actors:    list[str] = []
@@ -234,7 +240,10 @@ class AlphaAgent:
             decision = _parse_json(response.content[0].text.strip())
             # Calibrate AI scores against measurable evidence
             # This prevents hallucinated confidence values
-            decision = calibrate_ai_decision(decision)
+            # Pass confirmed evidence count to calibration
+            # More confirmed findings = higher ceiling for confidence
+            n_confirmed = len(self.confirmed_evidence)
+            decision = calibrate_ai_decision(decision, confirmed_count=n_confirmed)
             self._process_decision(decision)
             return decision
         except Exception as e:
@@ -254,8 +263,18 @@ class AlphaAgent:
             self.completed_paths.add(action_id)
             for f in critical_new:
                 self._calculate_blast_radius(f)
+                # Store as confirmed evidence for future hypothesis calibration
+                self.confirmed_evidence.append({
+                    "url":     action_id,
+                    "finding": f.title,
+                    "severity": str(f.severity).split(".")[-1],
+                    "description": (f.description or "")[:200],
+                })
             return "confirmed"
         elif not success or not findings:
+            # Track 401/protected endpoints so we stop retrying them
+            if "auth enforced" in str(findings).lower() or not findings:
+                self.refuted_paths.add(action_id)
             self.failed_paths.add(action_id)
             return "pivoting"
         return "new_hypothesis"
@@ -293,21 +312,37 @@ Write final complete threat assessment. Return complete status JSON."""
         hyp = decision.get("hypothesis", {})
         if hyp.get("statement"):
             print(f"[{self.alpha_id}] Hypothesis: {hyp['statement'][:120]}")
-            # Show calibrated score with evidence trail — not AI assertion
             conf     = hyp.get("confidence", "?")
             score    = hyp.get("score", "?")
             impact   = hyp.get("impact", "?")
+            status   = hyp.get("status", "UNCONFIRMED")
+            verif    = hyp.get("verification", "UNTESTED")
             cvss     = hyp.get("cvss_basis")
-            evidence = hyp.get("evidence_summary", "")
+            vector   = hyp.get("cvss_vector", "")
+            # Only show MEASURED blast radius — not AI narrative
+            blast    = hyp.get("blast_radius", "unknown — not yet measured")
+            # Override hallucinated blast radius — only measured values allowed
+            hallucination_phrases = [
+                "complete system", "all user", "thousands", "millions", "entire",
+                "all records", "complete database", "complete customer", "all data",
+                "potentially", "complete application", "complete exposure",
+                "full data", "all order", "complete crud", "all account",
+            ]
+            if any(x in str(blast).lower() for x in hallucination_phrases):
+                if self.confirmed_evidence:
+                    blast = f"pending measurement — {len(self.confirmed_evidence)} endpoint(s) confirmed so far"
+                else:
+                    blast = "not yet measured — no confirmed probes this cycle"
             reliable = hyp.get("score_reliable", True)
-            calib_note = hyp.get("calibration_note", "")
+            calib    = hyp.get("calibration_note", "")
 
-            cvss_str = f" | CVSS: {cvss}" if cvss else " | CVSS: no match"
-            print(f"[{self.alpha_id}] Score: {score} | Confidence: {conf} | Impact: {impact}{cvss_str}")
-            if evidence:
-                print(f"[{self.alpha_id}] Evidence: {evidence}")
-            if not reliable and calib_note:
-                print(f"[{self.alpha_id}] ⚠ {calib_note}")
+            cvss_str = f"est. CVSS: {cvss} [{vector}]" if cvss else "CVSS: no NVD match"
+            status_icon = "✅" if status == "OBSERVED" else "⚠️" if status == "INFERRED" else "❌"
+            print(f"[{self.alpha_id}] {status_icon} {status} | {verif}")
+            print(f"[{self.alpha_id}] Score: {score} | Conf: {conf} | Impact: {impact} | {cvss_str}")
+            print(f"[{self.alpha_id}] Blast radius: {blast}")
+            if not reliable and calib:
+                print(f"[{self.alpha_id}] ⚠ {calib}")
 
         patterns = decision.get("learned_patterns", [])
         for p in patterns:
@@ -370,31 +405,41 @@ Write final complete threat assessment. Return complete status JSON."""
     # ── Blast Radius ──────────────────────────────────────────────────────────
 
     def _calculate_blast_radius(self, finding: Finding):
+        """
+        Honest blast radius — only reports what was actually measured.
+        Never extrapolates to 'thousands of records' without proof.
+        """
         import requests
         from requests.packages.urllib3.exceptions import InsecureRequestWarning
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
         url = finding.file_path
         if not url or not url.startswith("http"):
+            finding.description += "\n📊 Blast radius: unknown — no URL to probe"
             return
         try:
-            resp = requests.get(url, timeout=5, verify=False,
-                                headers={"User-Agent": "Sentinel-SecurityScanner/1.0"})
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    count = len(data) if isinstance(data, list) else 1
-                    types = self._detect_data_types(str(data)[:500])
-                    if count > 1:
-                        finding.description += (
-                            f"\n BLAST RADIUS: {count} records exposed. "
-                            f"Data types: {', '.join(types)}."
-                        )
-                        print(f"[{self.alpha_id}] Blast radius: {count} records at {url}")
-                except (json.JSONDecodeError, ValueError):
-                    pass
-        except Exception:
-            pass
+            from sentinel.core.evidence import probe_with_evidence
+            resp, artifact = probe_with_evidence(url, auth_sent=False)
+
+            if resp and artifact.response.status_code == 200:
+                er = artifact.response
+                # Build measured blast radius from actual evidence
+                parts = []
+                if er.record_count is not None:
+                    parts.append(f"{er.record_count} records returned")
+                if er.sensitive_fields:
+                    parts.append(f"sensitive fields: {', '.join(er.sensitive_fields[:4])}")
+                if er.size_bytes:
+                    parts.append(f"{er.size_bytes} bytes")
+                parts.append(f"type: {er.response_type}")
+
+                blast = "MEASURED: " + " | ".join(parts) if parts else f"response received ({er.size_bytes}b)"
+                finding.description += f"\n📊 Blast radius (measured): {blast}"
+                print(f"[{self.alpha_id}] 📊 Blast radius: {blast}")
+            else:
+                finding.description += "\n📊 Blast radius: endpoint returned no data"
+        except Exception as e:
+            finding.description += "\n📊 Blast radius: measurement failed"
 
     def _detect_data_types(self, text: str) -> list[str]:
         text = text.lower()
@@ -445,39 +490,35 @@ Write final complete threat assessment. Return complete status JSON."""
 
     def _calculate_exploit_probability(self, finding: Finding) -> float:
         """
-        Evidence-based exploit probability.
-        Anchored to CVSS base scores from NVD where available.
-        No hallucinated confidence.
+        Evidence-based exploit probability tied to CVSS and observed status.
+        UNCONFIRMED findings never reach CRITICAL probability.
         """
         title = finding.title
         desc  = finding.description or ""
 
-        # Try CVSS anchor first — real-world score
-        cvss = _lookup_cvss(title, desc)
+        # CVSS anchor
+        cvss_def = _lookup_cvss_definition(title, desc)
+        cvss = cvss_def["score"] if cvss_def else None
+
         if cvss:
-            # CVSS 9.8 = 0.95 probability, CVSS 4.0 = 0.40 probability
-            # Formula: normalize to [0.1, 0.99] range
-            base_prob = 0.10 + (cvss / 10.0) * 0.89
+            base_prob = 0.10 + (cvss / 10.0) * 0.75  # CVSS 9.8 = max 0.835
         else:
-            base_prob = 0.40  # conservative default when no CVSS
+            base_prob = 0.25  # conservative — no CVSS match
 
-        # Evidence modifiers — observable facts only
-        title_lower = title.lower()
-        desc_lower  = desc.lower()
+        desc_lower = desc.lower()
 
-        # Positive evidence: things we actually confirmed
-        if "blast radius:" in desc_lower:       base_prob += 0.05  # confirmed real data
-        if "records exposed" in desc_lower:     base_prob += 0.05  # quantified impact
-        if "http 200" in desc_lower:            base_prob += 0.03  # endpoint confirmed
-        if "[alpha] targeted probe" in title_lower: base_prob += 0.03  # direct confirmation
+        # Only add for things ACTUALLY observed
+        if "blast radius (measured):" in desc_lower:  base_prob += 0.08
+        if "records returned" in desc_lower:          base_prob += 0.07
+        if "http 200" in desc_lower:                  base_prob += 0.05
 
-        # Uncertainty reductions — unconfirmed claims
-        if "potential" in title_lower:          base_prob -= 0.10
-        if "may" in desc_lower[:100]:           base_prob -= 0.05
-        if "possible" in desc_lower[:100]:      base_prob -= 0.05
-        if "spa_fallback" in desc_lower:        base_prob -= 0.15
+        # Reduce for unconfirmed/inferred
+        if "spa shell" in desc_lower or "spa fallback" in desc_lower: base_prob -= 0.20
+        if "likely spa" in desc_lower:                base_prob -= 0.15
+        if "not yet confirmed" in desc_lower:         base_prob -= 0.10
+        if "not confirmed" in desc_lower:             base_prob -= 0.10
 
-        return min(round(base_prob, 2), 0.99)
+        return min(max(round(base_prob, 2), 0.05), 0.95)
 
     def _exploit_rationale(self, prob: float) -> str:
         if prob >= 0.90: return "Trivially exploitable — no auth, no skill required"
@@ -605,6 +646,17 @@ Write final complete threat assessment. Return complete status JSON."""
         blocked = list(getattr(self.session, '_alpha_blocked_methods', set()))
         constraints = f"\nBLOCKED (do not retry): {blocked}\n" if blocked else ""
 
+        # Build confirmed evidence summary
+        confirmed_str = ""
+        if self.confirmed_evidence:
+            confirmed_str = "\nCONFIRMED FINDINGS (use these to elevate hypothesis confidence):\n"
+            for ce in self.confirmed_evidence[-5:]:
+                confirmed_str += f"  ✅ CONFIRMED: {ce['url']} → {ce['finding'][:60]}\n"
+
+        refuted_str = ""
+        if self.refuted_paths:
+            refuted_str = f"\nCONFIRMED PROTECTED (stop probing these): {list(self.refuted_paths)[-5:]}\n"
+
         return f"""Target: {self.session.target}
 Mode: {self.session.mode.value} | Cycle: {self.cycle}/{MAX_ALPHA_CYCLES}
 
@@ -612,7 +664,7 @@ Learned patterns:
 {patterns}
 Completed: {list(self.completed_paths)[-5:]}
 Failed: {list(self.failed_paths)[-5:]}
-{constraints}
+{confirmed_str}{refuted_str}{constraints}
 Attack graph ({len(self.attack_graph)} nodes):
 {self._format_attack_graph()}
 
@@ -660,9 +712,10 @@ Only use GET, POST, OPTIONS, HEAD. Return JSON only."""
 # ── Targeted Probe Executor ───────────────────────────────────────────────────
 
 def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
-    import requests
-    from requests.packages.urllib3.exceptions import InsecureRequestWarning
-    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+    """
+    Execute a targeted probe with full evidence capture.
+    Every probe produces a documented request/response artifact.
+    """
     from sentinel.core.validator import validate_action
     from urllib.parse import urlparse
 
@@ -683,56 +736,124 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
     try:
         validate_action(AgentName.PROBE, "http_probe", host, session)
     except Exception as e:
-        print(f"[ALPHA/PROBE] Scope violation: {e}")
+        print(f"[ALPHA/PROBE] Scope: {e}")
         return []
 
-    headers = {"User-Agent": "Sentinel-SecurityScanner/1.0",
-               **probe.get("headers", {})}
-
-    try:
-        if method == "GET":
-            resp = requests.get(url, headers=headers, timeout=10, verify=False)
-        elif method == "POST":
-            resp = requests.post(url, json=probe.get("body"), headers=headers,
-                                 timeout=10, verify=False)
-        elif method == "OPTIONS":
-            resp = requests.options(url, headers=headers, timeout=10, verify=False)
-        else:
-            resp = requests.head(url, headers=headers, timeout=10, verify=False)
-
-        return _analyze_probe_response(url, resp, probe.get("hypothesis", ""))
-
-    except requests.RequestException as e:
-        print(f"[ALPHA/PROBE] Failed: {e}")
-        return []
-
-
-def _analyze_probe_response(url: str, resp, hypothesis: str) -> list[Finding]:
-    if resp.status_code != 200 or len(resp.content) <= 100:
-        return []
-
-    preview   = resp.text[:300]
-    sensitive = [s for s in ["password", "token", "secret", "admin", "email",
-                              "credit", "ssn", "key", "role", "hash"]
-                 if s in preview.lower()]
-    severity  = Severity.CRITICAL if sensitive else Severity.HIGH
-    desc = (
-        f"Targeted probe: GET {url} -> HTTP {resp.status_code}, "
-        f"{len(resp.content)} bytes. Hypothesis: {hypothesis[:100]}. "
+    # Execute with full evidence capture
+    resp, artifact = probe_with_evidence(
+        url=url,
+        method=method,
+        headers=probe.get("headers", {}),
+        body=probe.get("body"),
+        auth_sent=False,
     )
-    if sensitive:
-        desc += f"Sensitive fields: {', '.join(sensitive)}."
 
+    # Always show the evidence in console
+    print(artifact.format_console())
+
+    if resp is None:
+        return []
+
+    # Run through formal pipeline — enforces state transitions
+    response_data = {
+        "status_code":  resp.status_code,
+        "content":      resp.text[:5000],
+        "size_bytes":   len(resp.content),
+        "content_type": resp.headers.get("Content-Type", ""),
+        "auth_sent":    False,
+    }
+
+    # Get or create pipeline from session
+    if not hasattr(session, '_pipeline'):
+        session._pipeline = FindingPipeline()
+
+    state, confirmed_bundle, negative = session._pipeline.test(
+        url=url,
+        method=method,
+        response_data=response_data,
+        hypothesis=probe.get("hypothesis", ""),
+    )
+
+    # Print pipeline verdict
+    if state == FindingState.CONFIRMED:
+        print(f"[PIPELINE] ✅ CONFIRMED: {url.split('/')[-1]} → {confirmed_bundle.promotion_reason}")
+    elif state == FindingState.REFUTED:
+        print(f"[PIPELINE] ❌ REFUTED:   {negative.format().splitlines()[0]}")
+    else:
+        print(f"[PIPELINE] 🔍 TESTED:    HTTP {resp.status_code} — inconclusive")
+
+    return _analyze_probe_response_with_evidence(
+        url, resp, artifact, probe.get("hypothesis", ""), state=state
+    )
+
+
+def _analyze_probe_response_with_evidence(url: str, resp,
+                                            artifact: EvidenceArtifact,
+                                            hypothesis: str,
+                                            state: FindingState = FindingState.TESTED) -> list[Finding]:
+    """
+    Analyze probe response using pipeline state.
+    Only creates findings for CONFIRMED state — pipeline enforces this.
+    """
+    status = resp.status_code
+    er     = artifact.response
+
+    # Pipeline already handled REFUTED cases — just skip
+    if state == FindingState.REFUTED:
+        return []
+
+    # Only CONFIRMED state produces findings
+    if state != FindingState.CONFIRMED:
+        return []
+
+    # Real data confirmed
     resource = url.rstrip("/").split("/")[-1].split("?")[0] or "endpoint"
+
+    # Build honest description with evidence
+    desc_parts = [
+        f"CONFIRMED: Unauthenticated {er.response_type} response from {url}.",
+        f"Evidence: HTTP {status} {er.status_text}, {er.size_bytes} bytes, "
+        f"Content-Type: {er.content_type[:40]}.",
+    ]
+    if er.record_count is not None:
+        desc_parts.append(f"Records returned: {er.record_count}.")
+    if er.sensitive_fields:
+        desc_parts.append(f"Sensitive fields detected: {', '.join(er.sensitive_fields)}.")
+    if er.sample:
+        desc_parts.append(f"Sample (sanitized): {er.sample}")
+
+    severity = Severity.CRITICAL if (er.sensitive_fields and er.record_count) else                Severity.HIGH if (er.sensitive_fields or er.record_count) else                Severity.MEDIUM
+
     return [Finding(
         agent=AgentName.PROBE,
-        title=f"[Alpha] Unauthenticated Data Exposure: {resource}",
-        description=desc,
+        title=f"[Alpha] Confirmed Unauthenticated Access: /{resource}",
+        description=" ".join(desc_parts),
         severity=severity,
         file_path=url,
         mitre_tactic="Collection",
         mitre_technique="T1213 — Data from Information Repositories",
-        remediation="Implement authentication and authorization before returning data.",
+        remediation=(
+            "Implement authentication middleware on this endpoint. "
+            "Return 401 Unauthorized for unauthenticated requests. "
+            "Verify authorization server-side before returning data."
+        ),
+    )]
+
+
+def _analyze_probe_response(url: str, resp, hypothesis: str) -> list[Finding]:
+    """Legacy — kept for compatibility. Use _analyze_probe_response_with_evidence."""
+    if resp.status_code != 200 or len(resp.content) <= 100:
+        return []
+    resource = url.rstrip("/").split("/")[-1].split("?")[0] or "endpoint"
+    return [Finding(
+        agent=AgentName.PROBE,
+        title=f"[Alpha] Unauthenticated Access: /{resource}",
+        description=f"HTTP 200 from {url} without auth. {len(resp.content)} bytes.",
+        severity=Severity.HIGH,
+        file_path=url,
+        mitre_tactic="Collection",
+        mitre_technique="T1213 — Data from Information Repositories",
+        remediation="Implement authentication on this endpoint.",
     )]
 
 

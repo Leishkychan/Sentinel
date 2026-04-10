@@ -95,18 +95,27 @@ def analyze_attack_chains(result: ScanResult) -> list[AttackChain]:
     if result.total == 0:
         return []
 
-    # Only send findings with substance — skip pure INFO
+    # Only chain findings that are CONFIRMED or at minimum INFERRED
+    # UNCONFIRMED hypotheses cannot form attack chains — that's assumption stacking
     meaningful = [
         f for f in result.findings
         if f.severity not in (Severity.INFO,)
+        and not f.title.startswith("[UNCONFIRMED]")
     ]
+    # Tag which findings are confirmed vs inferred for Claude
+    confirmed   = [f for f in meaningful if "blast radius (measured)" in (f.description or "").lower()
+                   or f.title.startswith("[Alpha] Unauthenticated")
+                   or f.agent in ("probe_agent", "config_agent", "recon_agent",
+                                  "injection_agent", "auth_scan_agent")]
+    inferred    = [f for f in meaningful if f not in confirmed]
+    print(f"[CHAIN] Confirmed findings: {len(confirmed)} | Inferred: {len(inferred)}")
 
     if len(meaningful) < 2:
         return []  # Can't form a chain with 1 finding
 
     print(f"[CHAIN] Analyzing {len(meaningful)} findings for attack chains...")
 
-    findings_json = _serialize_findings(meaningful)
+    findings_json = _serialize_findings_with_status(confirmed, inferred)
     raw_chains    = _call_claude(result.target, result.mode, findings_json)
     chains        = _parse_chains(raw_chains)
 
@@ -122,11 +131,40 @@ def _serialize_findings(findings: list[Finding]) -> str:
             "id":          f.finding_id,
             "severity":    f.severity,
             "title":       f.title,
-            "description": f.description[:300],  # truncate for context
+            "description": f.description[:300],
             "file":        f.file_path,
             "agent":       f.agent,
             "mitre":       f.mitre_tactic,
             "cve":         f.cve_id,
+        })
+    return json.dumps(items, indent=2, default=str)
+
+
+def _serialize_findings_with_status(confirmed: list[Finding],
+                                     inferred: list[Finding]) -> str:
+    """
+    Serialize findings with explicit confirmation status.
+    Claude must not chain INFERRED findings as if they were CONFIRMED.
+    """
+    items = []
+    for f in confirmed:
+        items.append({
+            "id":          f.finding_id,
+            "status":      "CONFIRMED",
+            "severity":    f.severity,
+            "title":       f.title,
+            "description": (f.description or "")[:300],
+            "agent":       f.agent,
+            "mitre":       f.mitre_tactic,
+        })
+    for f in inferred:
+        items.append({
+            "id":          f.finding_id,
+            "status":      "INFERRED — not directly confirmed",
+            "severity":    f.severity,
+            "title":       f.title,
+            "description": (f.description or "")[:200],
+            "agent":       f.agent,
         })
     return json.dumps(items, indent=2, default=str)
 

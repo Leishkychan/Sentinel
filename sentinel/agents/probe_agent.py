@@ -27,6 +27,7 @@ from urllib.parse import urljoin, urlparse, urlencode
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
+from sentinel.core.evidence import probe_with_evidence
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity, ScanMode,
 )
@@ -89,57 +90,95 @@ def _check_admin_endpoints(base: str, session: ScanSession) -> list[Finding]:
     """Check for accessible admin/privileged endpoints without auth."""
     findings = []
 
+    SPA_SIZE_MIN, SPA_SIZE_MAX = 70000, 82000
+
     for path in ADMIN_PATHS:
         url = base + path
-        try:
-            resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT,
-                                verify=False, allow_redirects=False)
+        resp, artifact = probe_with_evidence(url, method="GET", auth_sent=False)
 
-            if resp.status_code == 200:
-                # Check if it's a real response not just a redirect to login
-                content_len = len(resp.content)
-                if content_len > 100:
-                    findings.append(Finding(
-                        agent=AgentName.PROBE,
-                        title=f"Unauthenticated Access: {path}",
-                        description=(
-                            f"Endpoint {url} returned HTTP 200 with {content_len} bytes "
-                            f"without any authentication. This endpoint may expose sensitive "
-                            f"functionality or data."
-                        ),
-                        severity=Severity.CRITICAL,
-                        file_path=url,
-                        mitre_tactic="Initial Access",
-                        mitre_technique="T1190 — Exploit Public-Facing Application",
-                        remediation=(
-                            f"Implement authentication on {path}. "
-                            "Verify authorization checks are enforced server-side, not just client-side. "
-                            "Return 401/403 for unauthenticated requests."
-                        ),
-                    ))
+        if resp is None:
+            continue
 
-            elif resp.status_code == 403:
-                # 403 means it exists but is protected — still worth noting
+        status = resp.status_code
+        er = artifact.response
+
+        # Show evidence in console
+        print(f"[PROBE] {path}: HTTP {status} | {er.response_type} | {er.size_bytes}b | Auth: {'required' if er.auth_required else 'NOT required'}")
+
+        if status == 200:
+            content_len = er.size_bytes
+            is_spa = SPA_SIZE_MIN < content_len < SPA_SIZE_MAX and "html" in er.content_type.lower()
+
+            if is_spa:
+                # SPA shell — document but do NOT claim real admin access
                 findings.append(Finding(
                     agent=AgentName.PROBE,
-                    title=f"Protected Endpoint Exists: {path}",
+                    title=f"SPA Route Responds: {path}",
                     description=(
-                        f"Endpoint {url} returned HTTP 403. "
-                        "The endpoint exists and is protected, but its existence is confirmed. "
-                        "Verify the access control is properly implemented."
+                        f"Endpoint {url} returned HTTP 200 with {content_len} bytes (HTML). "
+                        f"Response matches SPA shell pattern — likely client-side routing, "
+                        f"not server-side admin functionality. "
+                        f"{artifact.format_report()}"
                     ),
                     severity=Severity.LOW,
                     file_path=url,
                     mitre_tactic="Discovery",
                     mitre_technique="T1083 — File and Directory Discovery",
                     remediation=(
-                        "Ensure 403 responses don't leak information about the endpoint structure. "
-                        "Consider returning 404 for non-admin users to prevent enumeration."
+                        "Verify whether this path exposes real admin functionality server-side. "
+                        "SPA routing may hide actual access control issues."
                     ),
                 ))
+            elif content_len > 100 and er.response_type == "JSON":
+                # Real JSON data — confirmed finding
+                findings.append(Finding(
+                    agent=AgentName.PROBE,
+                    title=f"Confirmed Unauthenticated Access: {path}",
+                    description=(
+                        f"CONFIRMED: {path} returns {er.response_type} data without authentication. "
+                        f"{artifact.format_report()}"
+                    ),
+                    severity=Severity.CRITICAL,
+                    file_path=url,
+                    mitre_tactic="Initial Access",
+                    mitre_technique="T1190 — Exploit Public-Facing Application",
+                    remediation=(
+                        f"Implement authentication on {path}. "
+                        "Return 401 for unauthenticated requests."
+                    ),
+                ))
+            elif content_len > 100:
+                # Unknown content — flag for review
+                findings.append(Finding(
+                    agent=AgentName.PROBE,
+                    title=f"Endpoint Accessible (Unverified): {path}",
+                    description=(
+                        f"HTTP 200 from {path} ({content_len} bytes, {er.response_type}). "
+                        f"Content type inconclusive — manual review needed. "
+                        f"{artifact.format_report()}"
+                    ),
+                    severity=Severity.MEDIUM,
+                    file_path=url,
+                    mitre_tactic="Discovery",
+                    mitre_technique="T1083 — File and Directory Discovery",
+                    remediation="Review endpoint manually to determine if real data is exposed.",
+                ))
 
-        except requests.RequestException:
-            continue
+        elif status == 403:
+            findings.append(Finding(
+                agent=AgentName.PROBE,
+                title=f"Endpoint Protected: {path}",
+                description=(
+                    f"HTTP 403 from {path} — access denied. "
+                    f"Endpoint exists but authorization enforced. "
+                    f"Request: GET {url} | Status: 403 Forbidden"
+                ),
+                severity=Severity.INFO,
+                file_path=url,
+                mitre_tactic="Discovery",
+                mitre_technique="T1083 — File and Directory Discovery",
+                remediation="Authorization appears enforced. Verify no bypass paths exist.",
+            ))
 
     return findings
 
