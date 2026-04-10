@@ -36,6 +36,9 @@ class AgentName(str, Enum):
     DEPS         = "deps_agent"
     CONFIG       = "config_agent"
     RECON        = "recon_agent"
+    NUCLEI       = "nuclei_agent"
+    LOGIC        = "logic_agent"
+    NETWORK      = "network_agent"
     AGGREGATOR   = "aggregator"
     REPORTER     = "reporter"
 
@@ -47,9 +50,14 @@ class ScanSession(BaseModel):
     target:           str
     mode:             ScanMode
     approved:         bool     = False
-    active_confirmed: bool     = False  # second confirm for ACTIVE mode
+    active_confirmed: bool     = False
     created_at:       datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     approved_targets: list[str] = Field(default_factory=list)
+
+    # Authenticated scanning support
+    auth_token:       Optional[str] = None   # Bearer token
+    auth_cookie:      Optional[str] = None   # Session cookie (name=value)
+    auth_headers:     dict          = Field(default_factory=dict)  # Custom headers
 
 
 # ── Individual Finding ────────────────────────────────────────────────────────
@@ -73,15 +81,20 @@ class Finding(BaseModel):
 # ── Scan Result (final output) ────────────────────────────────────────────────
 
 class ScanResult(BaseModel):
-    session_id:   str
-    target:       str
-    mode:         ScanMode
-    findings:     list[Finding] = Field(default_factory=list)
-    summary:      Optional[str] = None
-    total:        int = 0
-    by_severity:  dict = Field(default_factory=dict)
-    completed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-    agents_run:   list[AgentName] = Field(default_factory=list)
+    session_id:     str
+    target:         str
+    mode:           ScanMode
+    findings:       list[Finding] = Field(default_factory=list)
+    summary:        Optional[str] = None
+    total:          int = 0
+    by_severity:    dict = Field(default_factory=dict)
+    completed_at:   datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    agents_run:     list[AgentName] = Field(default_factory=list)
+
+    # Phase 3 additions
+    attack_chains:  list[dict] = Field(default_factory=list)
+    delta_summary:  Optional[str] = None
+    delta_markdown: Optional[str] = None
 
 
 # ── Audit Log Entry ───────────────────────────────────────────────────────────

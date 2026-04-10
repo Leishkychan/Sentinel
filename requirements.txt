@@ -1,26 +1,38 @@
-# Core
-anthropic==0.49.0
-langgraph==0.2.74
-langchain-core==0.3.52
-flask==3.1.0
-flask-cors==5.0.0
-flask-limiter==3.9.4
-python-dotenv==1.1.0
-pydantic==2.11.3
+# ── Core ──────────────────────────────────────────────────────────────────────
+anthropic>=0.49.0
+pydantic>=2.11.3
+python-dotenv>=1.1.0
+requests>=2.32.3
+urllib3>=2.0.0
 
-# Security scanning tools (Python-based)
-bandit==1.8.3
-pip-audit==2.9.0
-truffleHog3==3.0.9
+# ── Web framework ─────────────────────────────────────────────────────────────
+flask>=3.1.0
+flask-cors>=5.0.0
+flask-limiter>=3.9.4
 
-# Utilities
-requests==2.32.3
-rich==14.0.0        # pretty terminal output
-python-dateutil==2.9.0
+# ── Security scanning tools ───────────────────────────────────────────────────
+bandit>=1.8.3
+semgrep>=1.70.0
+pip-audit>=2.9.0
+truffleHog3>=3.0.9
 
-# Azure (optional - for Cosmos audit log)
-azure-cosmos==4.9.0
+# ── Multi-model consensus (optional — enables GPT-4o cross-reference) ─────────
+openai>=1.30.0
 
-# Testing
-pytest==8.3.5
-pytest-asyncio==0.25.3
+# ── Utilities ─────────────────────────────────────────────────────────────────
+rich>=14.0.0
+
+# ── Azure (optional — for Cosmos audit log) ───────────────────────────────────
+azure-cosmos>=4.9.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.3.5
+pytest-asyncio>=0.25.3
+
+# ── External tools (install separately — not Python packages) ─────────────────
+# nuclei:    go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest
+# subfinder: go install github.com/projectdiscovery/subfinder/v2/cmd/subfinder@latest  
+# nmap:      apt install nmap  OR  brew install nmap
+# govulncheck: go install golang.org/x/vuln/cmd/govulncheck@latest
+# bundle-audit: gem install bundler-audit
+# codeql:    https://github.com/github/codeql-cli-binaries/releases

@@ -3,4 +3,7 @@ from .sast_agent import run_sast_agent
 from .deps_agent import run_deps_agent
 from .config_agent import run_config_agent
 from .recon_agent import run_recon_agent
+from .nuclei_agent import run_nuclei_agent
+from .logic_agent import run_logic_agent
+from .network_agent import run_network_agent
 from .reporter import generate_report

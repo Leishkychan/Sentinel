@@ -32,24 +32,28 @@ MODE_PERMISSIONS: dict[ScanMode, set[str]] = {
         "sast_scan",
         "dependency_scan",
         "secrets_scan",
-        "file_read",           # read source files only
+        "file_read",
+        "logic_analysis",   # Claude code reasoning — no network
     },
     ScanMode.ACTIVE: {
-        # ACTIVE inherits all of PASSIVE + CODE + adds limited probing
         "dns_lookup",
         "whois_lookup",
         "http_headers",
         "whatweb_scan",
         "port_scan_passive",
-        "port_scan_active",    # nmap with port enumeration — still no exploitation
-        "http_probe",          # send HTTP requests to target, read responses
+        "port_scan_active",
+        "http_probe",
         "config_read",
         "header_analysis",
         "sast_scan",
         "dependency_scan",
         "secrets_scan",
         "file_read",
-        "spider_passive",      # crawl links, do not submit forms
+        "spider_passive",
+        "nuclei_scan",
+        "subfinder_scan",
+        "logic_analysis",
+        "network_topology",
     },
 }
 
