@@ -50,6 +50,48 @@ AUTH_KEYWORDS = [
 
 MAX_FILE_SIZE_KB = 100  # Skip files larger than this
 
+# Patterns that indicate prompt injection attempts embedded in source files
+_INJECTION_PATTERNS = [
+    "ignore previous instructions",
+    "ignore all instructions",
+    "disregard your instructions",
+    "you are now",
+    "new instructions:",
+    "system prompt:",
+    "forget your previous",
+    "override your",
+    "act as",
+    "jailbreak",
+    "pretend you are",
+    "ignore the above",
+    "ignore above",
+    "do not analyze",
+    "stop analyzing",
+]
+
+
+def _sanitize_file_content(content: str, filepath: str) -> tuple[str, bool]:
+    """
+    Check file content for prompt injection attempts before sending to Claude.
+    Returns (sanitized_content, injection_detected).
+    Strips suspicious lines and flags the file.
+    """
+    lines = content.splitlines()
+    clean_lines = []
+    injection_detected = False
+
+    for line in lines:
+        line_lower = line.lower().strip()
+        # Check inside comments and strings where injections hide
+        stripped = line_lower.lstrip("/#*\"' \t")
+        if any(pattern in stripped for pattern in _INJECTION_PATTERNS):
+            injection_detected = True
+            clean_lines.append(f"# [SENTINEL: suspicious line removed from {filepath}]")
+        else:
+            clean_lines.append(line)
+
+    return "\n".join(clean_lines), injection_detected
+
 
 LOGIC_ANALYSIS_PROMPT = """You are a senior application security engineer performing a security code review.
 Your job is to find logical security vulnerabilities that static analysis tools miss.
@@ -153,6 +195,11 @@ def _analyze_file(filepath: Path, session: ScanSession) -> list[Finding]:
         content = filepath.read_text(encoding="utf-8", errors="ignore")
         if not content.strip() or len(content) < 50:
             return []
+
+        # Guard against prompt injection embedded in source files
+        content, injection_detected = _sanitize_file_content(content, str(filepath))
+        if injection_detected:
+            print(f"[LOGIC] ⚠ Prompt injection attempt detected in {filepath.name} — sanitized before analysis")
 
         response = client.messages.create(
             model=MODEL,

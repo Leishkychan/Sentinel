@@ -39,12 +39,12 @@ def generate_report(result: ScanResult) -> dict:
 
     # Write JSON
     json_report = _build_json_report(result)
-    with open(json_path, "w") as f:
+    with open(json_path, "w", encoding="utf-8") as f:
         json.dump(json_report, f, indent=2, default=str)
 
     # Write Markdown
     md_content = _build_markdown_report(result)
-    with open(md_path, "w") as f:
+    with open(md_path, "w", encoding="utf-8") as f:
         f.write(md_content)
 
     print(f"[REPORTER] Reports saved: {json_path}, {md_path}")
