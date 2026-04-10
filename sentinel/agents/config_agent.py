@@ -120,8 +120,10 @@ def run_config_agent(session: ScanSession, target_url: str = None, source_path: 
 # ── HTTP Header Checks ────────────────────────────────────────────────────────
 
 def _check_http_headers(session: ScanSession, target_url: str) -> list[Finding]:
-    validate_action(AgentName.CONFIG, "http_headers", target_url, session)
-    validate_action(AgentName.CONFIG, "header_analysis", target_url, session)
+    from urllib.parse import urlparse
+    _host = urlparse(target_url).hostname or target_url
+    validate_action(AgentName.CONFIG, "http_headers", _host, session)
+    validate_action(AgentName.CONFIG, "header_analysis", _host, session)
 
     findings = []
     try:

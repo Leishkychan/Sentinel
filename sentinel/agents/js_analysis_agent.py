@@ -29,7 +29,7 @@ from sentinel.core import (
 
 HEADERS = {"User-Agent": "Sentinel-SecurityScanner/1.0"}
 TIMEOUT = 10
-MAX_JS_SIZE_KB = 500  # Skip JS files larger than 500KB
+MAX_JS_SIZE_KB = 2000  # Skip JS files larger than 2MB
 
 # Patterns that indicate secrets in JavaScript
 SECRET_PATTERNS = [
@@ -141,7 +141,12 @@ def _fetch_js(url: str) -> str | None:
         if size_kb > MAX_JS_SIZE_KB:
             print(f"[JS] Skipping {url} — too large ({size_kb:.0f}KB)")
             return None
-        return resp.text
+        # For large files, sample first 200KB + last 50KB (secrets often at top or bottom)
+        text = resp.text
+        if size_kb > 500:
+            print(f"[JS] Large file ({size_kb:.0f}KB) — sampling key sections")
+            text = text[:200000] + "\n/* ...SENTINEL SAMPLE... */\n" + text[-50000:]
+        return text
     except requests.RequestException:
         return None
 

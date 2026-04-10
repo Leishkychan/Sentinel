@@ -11,3 +11,4 @@ from .js_analysis_agent import run_js_agent
 from .api_agent import run_api_agent
 from .disclosure_agent import run_disclosure_agent
 from .reporter import generate_report
+from .alpha_agent import AlphaAgent, execute_targeted_probe

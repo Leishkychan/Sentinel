@@ -11,6 +11,7 @@ from sentinel.core.attack_chains import analyze_attack_chains, chains_to_dict
 from sentinel.core.delta import compute_delta, delta_to_markdown
 from sentinel.core.threat_intel import load_attack_data, enrich_finding_intel
 from sentinel.core.nvd_lookup import scan_service_versions
+from sentinel.agents.alpha_agent import AlphaAgent, execute_targeted_probe
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 MODEL  = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
@@ -21,8 +22,14 @@ Plan scans, adapt based on findings, think like a defender finding every vulnera
 
 Available agents: sast_agent, deps_agent, logic_agent, config_agent, recon_agent, network_agent, nuclei_agent, probe_agent, js_agent, api_agent, disclosure_agent
 
-Rules: Never suggest exploitation. Never fabricate CVEs. Only dispatch agents valid for the mode.
-PASSIVE=recon/config/network only. CODE=sast/deps/logic only. PROBE=probe/js/api/disclosure/config/recon/network. ACTIVE=all agents.
+Rules:
+- Never suggest exploitation. Never fabricate CVEs.
+- Only dispatch agents valid for the mode.
+- PASSIVE=recon/config/network only. CODE=sast/deps/logic only. PROBE=all probe agents. ACTIVE=all agents.
+- In PROBE/ACTIVE mode: probe_agent, js_agent, api_agent, disclosure_agent MUST all run eventually.
+- When replanning: you may reorder agents but never permanently drop probe agents.
+- If critical findings exist, prioritize agents that reveal blast radius and attack chains.
+- Think: "Given what I found, what do I need to run next to understand the full risk?"
 
 Return JSON only. No markdown, no preamble.
 Initial plan format: {"agents_to_run": ["agent_name"], "rationale": "why"}
@@ -72,6 +79,7 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
                     x.severity if x.severity in ["CRITICAL","HIGH","MEDIUM","LOW","INFO"] else "INFO"))[:3]:
                 print(f"  [{f.severity}] {f.title[:70]}")
 
+        # Autonomous replanning — Claude decides what to run next based on findings
         if not queue or any(f.severity in (Severity.CRITICAL, Severity.HIGH) for f in new_findings):
             replan = _replan(session, source_path, all_findings, done, queue)
             if replan.get("continue") and replan.get("next_agents"):
@@ -80,9 +88,35 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
                     print(f"[ORCHESTRATOR] Replan → {adds} | {replan.get('reason','')}")
                     queue.extend(adds)
 
+        # Autonomous safety net — for PROBE/ACTIVE, reason about dropped agents
+        # Don't just blindly add them — ask Claude if they're still needed given findings
+        if session.mode in (ScanMode.PROBE, ScanMode.ACTIVE):
+            probe_agents = ["probe_agent", "js_agent", "api_agent", "disclosure_agent"]
+            dropped = [a for a in probe_agents if a not in done and a not in queue]
+            if dropped and all_findings:
+                decision = _should_run_dropped(dropped, all_findings, session)
+                for agent, reason in decision.items():
+                    if agent not in done and agent not in queue:
+                        print(f"[ORCHESTRATOR] Autonomous decision → adding {agent}: {reason}")
+                        queue.append(agent)
+
     all_findings = enrich_all(all_findings)
     all_findings = _enrich_intel(all_findings)
     all_findings.extend(_nvd_check(session, all_findings))
+
+    # ALPHA AGENT — strategic reasoning layer
+    # Runs after initial agent sweep for PROBE and ACTIVE modes
+    if session.mode in (ScanMode.PROBE, ScanMode.ACTIVE) and all_findings:
+        print(f"\n[ORCHESTRATOR] Handing off to Alpha Agent for strategic analysis...")
+        alpha_findings = _run_alpha_investigation(
+            session, all_findings, agents_run, done, source_path
+        )
+        if alpha_findings:
+            all_findings.extend(alpha_findings)
+            all_findings = enrich_all(alpha_findings) + [
+                f for f in all_findings if f not in alpha_findings
+            ]
+            print(f"[ORCHESTRATOR] Alpha contributed {len(alpha_findings)} additional findings")
 
     result = _build_result(session, all_findings, agents_run)
 
@@ -267,6 +301,223 @@ def _nvd_check(session: ScanSession, findings: list[Finding]) -> list[Finding]:
         ))
     if nvd_findings: print(f"[ORCHESTRATOR] NVD: {len(nvd_findings)} CVEs found")
     return nvd_findings
+
+
+
+
+def _run_alpha_investigation(session: ScanSession, current_findings: list[Finding],
+                              agents_run: list[AgentName], agents_done: set,
+                              source_path: Optional[str]) -> list[Finding]:
+    """
+    Alpha Agent investigation loop.
+    Alpha reasons about findings, directs targeted probes and agents,
+    evaluates results, and builds a complete threat picture.
+    """
+    alpha = AlphaAgent(session, source_path)
+    alpha.add_findings(current_findings)
+
+    new_findings = []
+    consecutive_empty = 0
+
+    for cycle in range(AlphaAgent.__init__.__code__.co_consts[0]
+                       if False else 8):  # MAX_ALPHA_CYCLES
+
+        decision = alpha.think()
+        status = decision.get("status", "unknown")
+
+        if status == "complete":
+            print(f"[ALPHA] Investigation complete at cycle {alpha.cycle}")
+            break
+
+        if status in ("error", "need_more_data"):
+            consecutive_empty += 1
+            if consecutive_empty >= 2:
+                break
+            continue
+
+        consecutive_empty = 0
+
+        # Execute primary path
+        primary = decision.get("primary_path", {})
+        result_findings = []
+        success = False
+
+        if primary:
+            result_findings, success = _execute_alpha_action(
+                primary, session, source_path, agents_done
+            )
+
+        # If primary failed, try fallback
+        if not success or not result_findings:
+            for fb_key in ["fallback_path", "fallback_path_2"]:
+                fallback = decision.get(fb_key, {})
+                if fallback:
+                    print(f"[ALPHA] Primary failed — trying {fb_key}")
+                    result_findings, success = _execute_alpha_action(
+                        fallback, session, source_path, agents_done
+                    )
+                    if success and result_findings:
+                        break
+
+        # Evaluate what we got
+        action_id = (primary.get("agent") or
+                     primary.get("probe", {}).get("url", "unknown"))
+        outcome = alpha.evaluate_result(action_id, result_findings, success)
+        new_findings.extend(result_findings)
+
+        if outcome == "complete":
+            break
+
+    # Get Alpha's final conclusion
+    conclusion = alpha.conclude()
+
+    # Store Alpha's threat narrative and attack paths in the findings metadata
+    # by creating a special summary finding
+    if conclusion.get("threat_narrative"):
+        narrative_finding = Finding(
+            agent=AgentName.ALPHA,
+            title="[Alpha] Strategic Threat Assessment",
+            description=conclusion["threat_narrative"],
+            severity=Severity(conclusion.get("risk_score", "HIGH")),
+            mitre_tactic="Multiple",
+            mitre_technique="Multi-stage attack chain",
+            remediation="; ".join(conclusion.get("immediate_actions", [])[:3]),
+        )
+        new_findings.append(narrative_finding)
+
+    # Add confirmed attack paths as findings
+    for path in conclusion.get("attack_paths", []):
+        if path.get("confirmed"):
+            path_finding = Finding(
+                agent=AgentName.ALPHA,
+                title=f"[Alpha] Confirmed Attack Path: {path.get('title', 'Unknown')}",
+                description=(
+                    f"Blast radius: {path.get('blast_radius', 'Unknown')}\n"
+                    f"Steps: {' → '.join(path.get('steps', []))}"
+                ),
+                severity=Severity(path.get("severity", "HIGH")),
+                mitre_tactic="Multiple",
+                remediation=f"Break the chain: {path.get('break_point', 'Review findings')}",
+            )
+            new_findings.append(path_finding)
+
+    return new_findings
+
+
+def _execute_alpha_action(action: dict, session: ScanSession,
+                           source_path: Optional[str],
+                           agents_done: set) -> tuple[list[Finding], bool]:
+    """Execute a single Alpha-directed action. Returns (findings, success)."""
+    action_type = action.get("action", "")
+
+    if action_type == "targeted_probe":
+        probe = action.get("probe", {})
+        if not probe:
+            return [], False
+        print(f"[ALPHA] Targeted probe → {probe.get('url', '?')}")
+        findings = execute_targeted_probe(probe, session)
+        return findings, True
+
+    elif action_type == "run_agent":
+        agent_name = action.get("agent", "")
+        if not agent_name or agent_name in agents_done:
+            return [], False
+
+        print(f"[ALPHA] Directing agent → {agent_name}")
+        findings = _dispatch(agent_name, session, source_path)
+        agents_done.add(agent_name)
+        return findings, len(findings) > 0
+
+    return [], False
+
+
+def _should_run_dropped(dropped: list[str], findings: list[Finding],
+                         session: ScanSession) -> dict[str, str]:
+    """
+    Autonomous reasoning: given what we found, should we run agents
+    that were dropped from the queue?
+
+    Claude reasons about the findings and decides which dropped agents
+    are still needed and why — not a blanket "run everything."
+
+    Returns dict of {agent_name: reason_to_run}
+    """
+    if not dropped or not findings:
+        return {}
+
+    # Build context for Claude
+    critical_high = [f for f in findings if f.severity in (Severity.CRITICAL, Severity.HIGH)]
+    finding_summary = "\n".join([
+        f"- [{f.severity}] {f.title}: {f.description[:100]}"
+        for f in critical_high[:10]
+    ])
+
+    agent_purposes = {
+        "probe_agent":       "Tests endpoints for auth bypass, IDOR, rate limiting, method tampering",
+        "js_agent":          "Analyzes JavaScript for secrets, hidden endpoints, source map exposure",
+        "api_agent":         "Tests GraphQL introspection, Swagger exposure, API auth weaknesses",
+        "disclosure_agent":  "Checks for sensitive file exposure, stack traces, debug endpoints, directory listing",
+    }
+
+    dropped_desc = "\n".join([
+        f"- {a}: {agent_purposes.get(a, 'Unknown')}"
+        for a in dropped
+    ])
+
+    prompt = f"""You are Sentinel's autonomous decision engine.
+
+We found these security issues so far:
+{finding_summary}
+
+These agents were dropped from the scan queue and haven't run yet:
+{dropped_desc}
+
+For each dropped agent, decide:
+1. Is it still relevant given what we found?
+2. Would running it reveal additional blast radius or attack vectors?
+3. Should it run NOW (before other agents) or can it wait?
+
+Return JSON only:
+{{
+  "agent_name": "specific reason this agent should run given the findings above",
+  "agent_name2": "specific reason"
+}}
+
+Only include agents that SHOULD run. If an agent is not relevant, omit it.
+If no agents should run, return {{}}.
+"""
+
+    try:
+        resp = client.messages.create(
+            model=MODEL, max_tokens=400, system=SYSTEM,
+            messages=[{"role": "user", "content": prompt}]
+        )
+        raw = _clean(resp.content[0].text)
+        decision = json.loads(raw)
+        # Validate — only return known agent names
+        return {k: v for k, v in decision.items()
+                if k in [e.value for e in AgentName]}
+    except Exception:
+        # Fallback: if Claude fails, use rule-based logic
+        result = {}
+        titles = " ".join(f.title.lower() for f in findings)
+
+        if "api_agent" in dropped:
+            if any(kw in titles for kw in ["unauthenticated", "idor", "admin", "endpoint", "api"]):
+                result["api_agent"] = "Critical auth findings require API depth analysis"
+
+        if "disclosure_agent" in dropped:
+            if any(kw in titles for kw in ["exposed", "hidden", "javascript", "endpoint", "admin"]):
+                result["disclosure_agent"] = "Exposed endpoints found — check for sensitive file disclosure"
+
+        if "js_agent" in dropped:
+            if any(kw in titles for kw in ["api", "endpoint", "admin", "token"]):
+                result["js_agent"] = "API/admin findings warrant JavaScript source analysis"
+
+        if "probe_agent" in dropped:
+            result["probe_agent"] = "Probe agent should always run in PROBE mode"
+
+        return result
 
 
 def _build_result(session, findings, agents_run):

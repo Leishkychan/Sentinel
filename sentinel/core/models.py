@@ -44,6 +44,7 @@ class AgentName(str, Enum):
     JS           = "js_agent"
     API          = "api_agent"
     DISCLOSURE   = "disclosure_agent"
+    ALPHA        = "alpha_agent"
     AGGREGATOR   = "aggregator"
     REPORTER     = "reporter"
 
