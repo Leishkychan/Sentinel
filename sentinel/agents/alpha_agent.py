@@ -27,6 +27,10 @@ from anthropic import Anthropic
 from sentinel.core.models import (
     ScanMode, AgentName, ScanSession, Finding, Severity,
 )
+from sentinel.core.scoring import (
+    score_hypothesis, score_finding, calibrate_ai_decision,
+    CVSS_BASELINE, _lookup_cvss, _infer_impact,
+)
 
 client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
@@ -91,11 +95,35 @@ class AlphaReport:
 
 ALPHA_SYSTEM = """You are Sentinel Alpha v2 — elite autonomous threat investigator.
 
-HYPOTHESIS SCORING before every action:
-  score = (confidence x impact_value) / cost
+HYPOTHESIS SCORING — evidence-based only, no assertion:
+  Your confidence claim will be CALIBRATED against measurable evidence.
+  A system will check your score against what was actually observed.
+  If you claim 0.9 but evidence only supports 0.4, your score becomes 0.4.
+
+  Confidence MUST be based on observable evidence:
+  - HTTP 200 confirmed? +0.35
+  - Sensitive fields in response? +0.25
+  - No auth header required? +0.30
+  - Multiple records returned? +0.20
+  - Pattern confirmed on 2+ endpoints? +0.20
+
+  Confidence MUST be reduced by uncertainty:
+  - Not yet confirmed by direct probe? -0.20
+  - Response could be SPA fallback? -0.25
+  - Only one observation? -0.10
+  - Could be redirect to login? -0.35
+
+  CVSS anchors (use these as your impact basis):
+  - Unauthenticated admin access: CVSS 9.8 = CRITICAL
+  - SQL injection condition: CVSS 9.8 = CRITICAL
+  - Unauthenticated API: CVSS 7.5 = HIGH
+  - IDOR: CVSS 6.5 = HIGH
+  - JWT none algorithm: CVSS 9.1 = CRITICAL
+  - No rate limiting: CVSS 5.3 = MEDIUM
+
+  score = (calibrated_confidence x impact_value) / cost
   impact_value: CRITICAL=4, HIGH=3, MEDIUM=2, LOW=1
   cost: requests needed (1=single probe, 3=agent run)
-  Test highest-scoring hypothesis first.
 
 ATTACK GRAPH: Every finding enables something.
   Unauthenticated endpoint -> data theft, enumeration, admin access
@@ -204,6 +232,9 @@ class AlphaAgent:
                 messages=[{"role": "user", "content": self._build_prompt()}],
             )
             decision = _parse_json(response.content[0].text.strip())
+            # Calibrate AI scores against measurable evidence
+            # This prevents hallucinated confidence values
+            decision = calibrate_ai_decision(decision)
             self._process_decision(decision)
             return decision
         except Exception as e:
@@ -262,7 +293,21 @@ Write final complete threat assessment. Return complete status JSON."""
         hyp = decision.get("hypothesis", {})
         if hyp.get("statement"):
             print(f"[{self.alpha_id}] Hypothesis: {hyp['statement'][:120]}")
-            print(f"[{self.alpha_id}] Score: {hyp.get('score','?')} | Confidence: {hyp.get('confidence','?')} | Impact: {hyp.get('impact','?')}")
+            # Show calibrated score with evidence trail — not AI assertion
+            conf     = hyp.get("confidence", "?")
+            score    = hyp.get("score", "?")
+            impact   = hyp.get("impact", "?")
+            cvss     = hyp.get("cvss_basis")
+            evidence = hyp.get("evidence_summary", "")
+            reliable = hyp.get("score_reliable", True)
+            calib_note = hyp.get("calibration_note", "")
+
+            cvss_str = f" | CVSS: {cvss}" if cvss else " | CVSS: no match"
+            print(f"[{self.alpha_id}] Score: {score} | Confidence: {conf} | Impact: {impact}{cvss_str}")
+            if evidence:
+                print(f"[{self.alpha_id}] Evidence: {evidence}")
+            if not reliable and calib_note:
+                print(f"[{self.alpha_id}] ⚠ {calib_note}")
 
         patterns = decision.get("learned_patterns", [])
         for p in patterns:
@@ -399,21 +444,40 @@ Write final complete threat assessment. Return complete status JSON."""
         self.exploit_probs.sort(key=lambda x: x["probability"], reverse=True)
 
     def _calculate_exploit_probability(self, finding: Finding) -> float:
-        title = finding.title.lower()
-        desc  = (finding.description or "").lower()
-        prob  = 0.5
-        if "unauthenticated" in title: prob += 0.35
-        if "no rate limit" in desc:    prob += 0.20
-        if "sql" in title:             prob += 0.30
-        if "admin" in title:           prob += 0.25
-        if "idor" in title:            prob += 0.25
-        if "hardcoded" in title:       prob += 0.40
-        if "jwt" in title and "none" in desc: prob += 0.45
-        sev = str(finding.severity).split(".")[-1]
-        if sev == "CRITICAL": prob += 0.15
-        elif sev == "HIGH":   prob += 0.10
-        elif sev == "LOW":    prob -= 0.10
-        return min(round(prob, 2), 0.99)
+        """
+        Evidence-based exploit probability.
+        Anchored to CVSS base scores from NVD where available.
+        No hallucinated confidence.
+        """
+        title = finding.title
+        desc  = finding.description or ""
+
+        # Try CVSS anchor first — real-world score
+        cvss = _lookup_cvss(title, desc)
+        if cvss:
+            # CVSS 9.8 = 0.95 probability, CVSS 4.0 = 0.40 probability
+            # Formula: normalize to [0.1, 0.99] range
+            base_prob = 0.10 + (cvss / 10.0) * 0.89
+        else:
+            base_prob = 0.40  # conservative default when no CVSS
+
+        # Evidence modifiers — observable facts only
+        title_lower = title.lower()
+        desc_lower  = desc.lower()
+
+        # Positive evidence: things we actually confirmed
+        if "blast radius:" in desc_lower:       base_prob += 0.05  # confirmed real data
+        if "records exposed" in desc_lower:     base_prob += 0.05  # quantified impact
+        if "http 200" in desc_lower:            base_prob += 0.03  # endpoint confirmed
+        if "[alpha] targeted probe" in title_lower: base_prob += 0.03  # direct confirmation
+
+        # Uncertainty reductions — unconfirmed claims
+        if "potential" in title_lower:          base_prob -= 0.10
+        if "may" in desc_lower[:100]:           base_prob -= 0.05
+        if "possible" in desc_lower[:100]:      base_prob -= 0.05
+        if "spa_fallback" in desc_lower:        base_prob -= 0.15
+
+        return min(round(base_prob, 2), 0.99)
 
     def _exploit_rationale(self, prob: float) -> str:
         if prob >= 0.90: return "Trivially exploitable — no auth, no skill required"
