@@ -44,9 +44,14 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     done:         set = set()
     iteration     = 0
 
-    plan  = _initial_plan(session, source_path)
-    queue = list(plan.get("agents_to_run", _default_agents(session, source_path)))
-    print(f"[ORCHESTRATOR] Plan: {queue} | {plan.get('rationale','')}")
+    # PROBE mode always runs all probe agents — don't let Claude skip them
+    if session.mode == ScanMode.PROBE:
+        queue = _default_agents(session, source_path)
+        print(f"[ORCHESTRATOR] PROBE mode — full agent suite: {queue}")
+    else:
+        plan  = _initial_plan(session, source_path)
+        queue = list(plan.get("agents_to_run", _default_agents(session, source_path)))
+        print(f"[ORCHESTRATOR] Plan: {queue} | {plan.get('rationale','')}")
 
     while queue and iteration < MAX_ITERATIONS:
         iteration += 1

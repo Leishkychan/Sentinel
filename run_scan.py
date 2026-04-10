@@ -19,7 +19,7 @@ from sentinel.agents import run_orchestrator, generate_report
 def main():
     parser = argparse.ArgumentParser(description="Sentinel — Quick Scan Runner")
     parser.add_argument("--target",  required=True, help="Scan target (must be in APPROVED_TARGETS)")
-    parser.add_argument("--mode",    default="CODE", choices=["PASSIVE", "CODE", "ACTIVE"])
+    parser.add_argument("--mode",    default="CODE", choices=["PASSIVE", "CODE", "PROBE", "ACTIVE"])
     parser.add_argument("--path",    default=None,   help="Path to source code (required for CODE mode)")
     parser.add_argument("--confirm", action="store_true", help="Confirm you have authorization to scan this target")
     args = parser.parse_args()

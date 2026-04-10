@@ -44,7 +44,7 @@ def generate_report(result: ScanResult) -> dict:
 
     # Write Markdown
     md_content = _build_markdown_report(result)
-    with open(md_path, "w") as f:
+    with open(md_path, "w", encoding="utf-8") as f:
         f.write(md_content)
 
     print(f"[REPORTER] Reports saved: {json_path}, {md_path}")
