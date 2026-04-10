@@ -26,6 +26,9 @@ Alpha NEVER:
   - Builds payloads
   - Acts on findings directly
   - Stops investigating prematurely
+  - Retries a method the safety guard has already blocked
+  - Uses DELETE, PUT, PATCH, or PATCH in targeted probes — these are BLOCKED
+  - Wastes cycles repeating failed paths
 
 Alpha ALWAYS:
   - Reasons about findings in combination, not isolation
@@ -83,6 +86,11 @@ logic_agent (needs source_path), nuclei_agent (ACTIVE mode only)
 
 You can also direct TARGETED PROBES — specific HTTP requests to specific URLs
 when you need to test a precise hypothesis without running a full agent.
+
+CRITICAL: Targeted probes are READ-ONLY. Only GET, POST (auth testing), OPTIONS, HEAD are allowed.
+DELETE, PUT, PATCH are permanently blocked. Do not attempt them.
+If you want to document that an endpoint ALLOWS dangerous methods, create a finding — don't probe it.
+After a method is blocked once, NEVER suggest it again in any cycle.
 
 Hard rules — you NEVER break these:
 - Never suggest exploitation of any finding
@@ -156,6 +164,8 @@ class AlphaAgent:
         self.current_hypothesis = None
         self.completed_paths: set[str] = set()
         self.failed_paths: set[str] = set()
+        self.blocked_methods: set[str] = set()  # Methods the safety guard blocked
+        self.learned_constraints: list[str] = []  # What Alpha has learned this session
         self.threat_narrative: Optional[str] = None
         self.confirmed_attack_paths: list[dict] = []
         self.model = self._get_best_model()
@@ -289,6 +299,15 @@ Focus on:
         mode_context = f"Scan mode: {self.session.mode.value}"
         source_context = f"Source code available: {'Yes' if self.source_path else 'No'}"
 
+        # Build learned constraints
+        blocked = list(getattr(self.session, '_alpha_blocked_methods', set()))
+        constraints = ""
+        if blocked:
+            constraints = f"\n\nLEARNED CONSTRAINTS (do not attempt these):\n"
+            constraints += f"- HTTP methods blocked by safety guard: {blocked}\n"
+            constraints += "- Only use GET, POST, OPTIONS, HEAD for targeted probes\n"
+            constraints += "- To test dangerous method exposure, note it as a finding — don't try to execute it\n"
+
         return f"""Target: {self.session.target}
 {mode_context}
 {source_context}
@@ -299,11 +318,12 @@ Current hypothesis:
 
 Paths completed: {completed if completed else 'None yet'}
 Paths that failed/empty: {failed if failed else 'None yet'}
-
+{constraints}
 Current findings ({len(self.all_findings)} total):
 {findings_text}
 
 What should I investigate next? What's my primary path, and what are my fallbacks?
+Focus on READ-ONLY probes (GET requests). Do not suggest DELETE/PUT/PATCH.
 Return your reasoning and direction as JSON."""
 
     def _serialize_findings(self, findings: list[Finding]) -> str:
