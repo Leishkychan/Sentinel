@@ -443,8 +443,15 @@ def score_alpha_hypothesis(statement: str, ai_confidence: float,
         status       = FindingStatus.OBSERVED
         verification = VerificationResult.CONFIRMED
     elif http_response:
-        status       = FindingStatus.INFERRED
-        verification = VerificationResult.INCONCLUSIVE
+        sc = http_response.get("status_code", 0)
+        # 401/403/404 are definitive negative signals — not ambiguous
+        if sc in (401, 403, 404):
+            status       = FindingStatus.INFERRED
+            verification = VerificationResult.REFUTED
+        else:
+            # 500, other non-200 — genuinely ambiguous
+            status       = FindingStatus.INFERRED
+            verification = VerificationResult.INCONCLUSIVE
     else:
         status       = FindingStatus.UNCONFIRMED
         verification = VerificationResult.UNTESTED
@@ -458,14 +465,16 @@ def score_alpha_hypothesis(statement: str, ai_confidence: float,
     if http_response:
         evidence = _build_evidence_items(http_response)
 
-    # Calibrate
     # If we have confirmed evidence from this session, raise the ceiling
     # Each confirmed finding adds evidence context to subsequent hypotheses
+    # Guard: never elevate a REFUTED result — 401/403/404 are definitive negatives
     if confirmed_count > 0 and status == FindingStatus.UNCONFIRMED:
         # We have real confirmed findings — elevate to INFERRED minimum
         status = FindingStatus.INFERRED
-        if confirmed_count >= 2:
-            verification = VerificationResult.INCONCLUSIVE  # Pattern emerging
+        # Only set INCONCLUSIVE if we actually have an http_response to be inconclusive about
+        # Pre-probe decisions (http_response=None) must stay UNTESTED — they haven't run yet
+        if confirmed_count >= 2 and http_response is not None and verification != VerificationResult.REFUTED:
+            verification = VerificationResult.INCONCLUSIVE  # Pattern emerging from actual responses
 
     calibrated, delta = calibrate_confidence(
         ai_confidence, status, verification, cvss_score, evidence

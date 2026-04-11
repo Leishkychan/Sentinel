@@ -24,8 +24,7 @@ import json
 import re
 import requests
 from urllib.parse import urljoin, urlparse, urlencode
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+# TLS warnings suppressed per-request in safe_request/probe_with_evidence
 
 from sentinel.core.evidence import probe_with_evidence
 from sentinel.core import (
@@ -131,6 +130,20 @@ def _check_admin_endpoints(base: str, session: ScanSession) -> list[Finding]:
                 ))
             elif content_len > 100 and er.response_type == "JSON":
                 # Real JSON data — confirmed finding
+                # Construct EvidenceRef from the already-executed probe_with_evidence result.
+                # All fields come from er (ResponseArtifact) — nothing synthesized.
+                from sentinel.core.models import EvidenceRef as _ERef
+                _ev = _ERef(
+                    method="GET",
+                    url=url,
+                    status_code=resp.status_code,
+                    response_type=er.response_type,
+                    size_bytes=er.size_bytes,
+                    auth_sent=False,
+                    sensitive_fields=er.sensitive_fields,
+                    record_count=er.record_count,
+                    proof_snippet=er.sample,
+                )
                 findings.append(Finding(
                     agent=AgentName.PROBE,
                     title=f"Confirmed Unauthenticated Access: {path}",
@@ -140,6 +153,7 @@ def _check_admin_endpoints(base: str, session: ScanSession) -> list[Finding]:
                     ),
                     severity=Severity.CRITICAL,
                     file_path=url,
+                    evidence=_ev,
                     mitre_tactic="Initial Access",
                     mitre_technique="T1190 — Exploit Public-Facing Application",
                     remediation=(

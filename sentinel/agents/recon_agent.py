@@ -16,7 +16,8 @@ NEVER: exploits, fuzzes, brute forces, submits forms, modifies anything.
 import subprocess
 import socket
 import json
-import requests
+import requests  # for RequestException type only
+from sentinel.core.evidence import safe_request
 from datetime import datetime, timezone
 
 from sentinel.core import (
@@ -106,9 +107,7 @@ def _http_headers(session: ScanSession, target: str) -> list[Finding]:
     url = target if target.startswith("http") else f"http://{target}"
 
     try:
-        resp = requests.get(url, timeout=10, verify=False,
-                            headers={"User-Agent": "Sentinel-SecurityScanner/1.0"},
-                            allow_redirects=True)
+        resp = safe_request("GET", url, timeout=10, allow_redirects=True)
 
         # Collect interesting headers as INFO findings
         interesting = {}

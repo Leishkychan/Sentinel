@@ -40,7 +40,14 @@ from sentinel.core.models import (
     ScanMode, AgentName, ScanSession, Finding, ScanResult, Severity,
 )
 
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+_client = None
+
+def _get_client():
+    """Lazy Anthropic client — not created until first use."""
+    global _client
+    if _client is None:
+        _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    return _client
 QUEEN_MODEL    = os.getenv("ALPHA_MODEL", "claude-opus-4-5-20251001")
 FALLBACK_MODEL = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
 
@@ -184,7 +191,7 @@ class QueenAgent:
 
     def _get_best_model(self) -> str:
         try:
-            client.messages.create(
+            _get_client().messages.create(
                 model=QUEEN_MODEL, max_tokens=10,
                 messages=[{"role": "user", "content": "test"}]
             )
@@ -242,7 +249,7 @@ class QueenAgent:
                 if not should:
                     print(f"[QUEEN] Skipping duplicate objective: {reason}")
                     continue
-                print(f"\n[QUEEN] Spawning Alpha for: {obj_desc[:80]}")
+                print(f"\n[QUEEN] Spawning Alpha for: {obj_desc[:120]}")
 
                 # Run targeted agents for this objective
                 objective_findings = self._execute_objective(obj, agents_done)
@@ -278,7 +285,7 @@ class QueenAgent:
     def _run_alpha(self, objective: str, findings: list[Finding],
                    agents_done: set) -> AlphaResult:
         """Run a single Alpha investigation cycle."""
-        from sentinel.agents.alpha_agent import AlphaAgent, execute_targeted_probe
+        from sentinel.agents.alpha_agent import AlphaAgent, execute_targeted_probe, MAX_ALPHA_CYCLES
         from sentinel.agents.orchestrator import _dispatch
 
         self.alpha_count += 1
@@ -289,7 +296,7 @@ class QueenAgent:
         new_findings = []
         consecutive_empty = 0
 
-        for _ in range(10):  # Max alpha cycles
+        for _ in range(MAX_ALPHA_CYCLES):  # Honour the same limit Alpha enforces itself
             decision = alpha.think()
             status   = decision.get("status", "")
 
@@ -485,7 +492,7 @@ As Queen, review this intelligence and decide:
 Return your strategic directive as JSON."""
 
         try:
-            response = client.messages.create(
+            response = _get_client().messages.create(
                 model=self.model, max_tokens=2000,
                 system=QUEEN_SYSTEM,
                 messages=[{"role": "user", "content": prompt}]
@@ -591,7 +598,7 @@ Deliver the final organizational verdict. Return complete status JSON.
 Include executive summary, top attack paths, remediation priority, and defensive posture score."""
 
         try:
-            response = client.messages.create(
+            response = _get_client().messages.create(
                 model=self.model, max_tokens=4000,
                 system=QUEEN_SYSTEM,
                 messages=[{"role": "user", "content": prompt}]

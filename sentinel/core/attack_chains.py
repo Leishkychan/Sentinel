@@ -29,7 +29,14 @@ from anthropic import Anthropic
 
 from .models import Finding, Severity, ScanResult
 
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+_client = None
+
+def _get_client():
+    """Lazy Anthropic client — not created until first use."""
+    global _client
+    if _client is None:
+        _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    return _client
 MODEL  = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
 
 
@@ -188,7 +195,7 @@ Findings:
 
 Identify all viable attack chains. Return the JSON array only.
 """
-    response = client.messages.create(
+    response = _get_client().messages.create(
         model=MODEL,
         max_tokens=4000,
         system=CHAIN_SYSTEM_PROMPT,

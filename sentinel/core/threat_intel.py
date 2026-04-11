@@ -22,8 +22,7 @@ import time
 from pathlib import Path
 from typing import Optional
 import requests
-from urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+# TLS warnings suppressed per-request in safe_request/probe_with_evidence
 
 # Cache location
 CACHE_DIR  = Path("data/threat_intel")
@@ -100,7 +99,7 @@ def get_dfend_countermeasures(technique_id: str) -> list[str]:
     """
     try:
         url = f"{DFEND_API}/{technique_id}.json"
-        resp = requests.get(url, timeout=5, verify=False)
+        resp = requests.get(url, timeout=5)
         if resp.status_code != 200:
             return []
         data = resp.json()
@@ -190,7 +189,7 @@ def _cache_is_fresh() -> bool:
 
 def _download_and_cache() -> bool:
     try:
-        resp = requests.get(ATTACK_URL, timeout=60, verify=False)
+        resp = requests.get(ATTACK_URL, timeout=60)
         resp.raise_for_status()
         ATTACK_CACHE.write_text(resp.text, encoding="utf-8")
         print(f"[INTEL] ATT&CK downloaded ({len(resp.content) // 1024}KB)")

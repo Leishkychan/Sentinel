@@ -32,7 +32,14 @@ from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity, ScanMode,
 )
 
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+_client = None
+
+def _get_client():
+    """Lazy Anthropic client — not created until first use."""
+    global _client
+    if _client is None:
+        _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    return _client
 MODEL  = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
 
 # File extensions to analyze for logic flaws
@@ -154,7 +161,7 @@ def _analyze_file(filepath: Path, session: ScanSession) -> list[Finding]:
         if not content.strip() or len(content) < 50:
             return []
 
-        response = client.messages.create(
+        response = _get_client().messages.create(
             model=MODEL,
             max_tokens=2000,
             system=LOGIC_ANALYSIS_PROMPT,

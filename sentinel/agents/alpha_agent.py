@@ -36,7 +36,14 @@ from sentinel.core.scoring import (
     _lookup_cvss_definition,
 )
 
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+_client = None
+
+def _get_client():
+    """Lazy Anthropic client — not created until first use."""
+    global _client
+    if _client is None:
+        _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    return _client
 
 ALPHA_MODEL    = os.getenv("ALPHA_MODEL", "claude-opus-4-5-20251001")
 FALLBACK_MODEL = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
@@ -218,7 +225,7 @@ class AlphaAgent:
 
     def _get_best_model(self) -> str:
         try:
-            client.messages.create(
+            _get_client().messages.create(
                 model=ALPHA_MODEL, max_tokens=10,
                 messages=[{"role": "user", "content": "test"}]
             )
@@ -364,7 +371,7 @@ class AlphaAgent:
 
         # ── Free hypothesis: queue empty, reason from evidence ────────────────
         try:
-            response = client.messages.create(
+            response = _get_client().messages.create(
                 model=self.model,
                 max_tokens=2500,
                 system=ALPHA_SYSTEM,
@@ -425,7 +432,7 @@ Findings:
 Write final complete threat assessment. Return complete status JSON."""
 
         try:
-            response = client.messages.create(
+            response = _get_client().messages.create(
                 model=self.model, max_tokens=4000,
                 system=ALPHA_SYSTEM,
                 messages=[{"role": "user", "content": prompt}],
@@ -534,41 +541,8 @@ Write final complete threat assessment. Return complete status JSON."""
     # ── Blast Radius ──────────────────────────────────────────────────────────
 
     def _calculate_blast_radius(self, finding: Finding):
-        """
-        Honest blast radius — only reports what was actually measured.
-        Never extrapolates to 'thousands of records' without proof.
-        """
-        import requests
-        from requests.packages.urllib3.exceptions import InsecureRequestWarning
-        requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
-
-        url = finding.file_path
-        if not url or not url.startswith("http"):
-            finding.description += "\n📊 Blast radius: unknown — no URL to probe"
-            return
-        try:
-            from sentinel.core.evidence import probe_with_evidence
-            resp, artifact = probe_with_evidence(url, auth_sent=False)
-
-            if resp and artifact.response.status_code == 200:
-                er = artifact.response
-                # Build measured blast radius from actual evidence
-                parts = []
-                if er.record_count is not None:
-                    parts.append(f"{er.record_count} records returned")
-                if er.sensitive_fields:
-                    parts.append(f"sensitive fields: {', '.join(er.sensitive_fields[:4])}")
-                if er.size_bytes:
-                    parts.append(f"{er.size_bytes} bytes")
-                parts.append(f"type: {er.response_type}")
-
-                blast = "MEASURED: " + " | ".join(parts) if parts else f"response received ({er.size_bytes}b)"
-                finding.description += f"\n📊 Blast radius (measured): {blast}"
-                print(f"[{self.alpha_id}] 📊 Blast radius: {blast}")
-            else:
-                finding.description += "\n📊 Blast radius: endpoint returned no data"
-        except Exception as e:
-            finding.description += "\n📊 Blast radius: measurement failed"
+        """Delegates to module-level _measure_blast_radius — no __new__ workaround needed."""
+        _measure_blast_radius(finding, alpha_id=self.alpha_id)
 
     def _detect_data_types(self, text: str) -> list[str]:
         text = text.lower()
@@ -928,12 +902,15 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
         return []
 
     # Run through formal pipeline — enforces state transitions
+    # Pass record_count from artifact (parsed from full response) so pipeline
+    # doesn't have to re-parse the truncated content and output "unknown records"
     response_data = {
         "status_code":  resp.status_code,
         "content":      resp.text[:5000],
         "size_bytes":   len(resp.content),
         "content_type": resp.headers.get("Content-Type", ""),
         "auth_sent":    False,
+        "record_count": artifact.response.record_count,  # from full response, not truncated
     }
 
     # Get or create pipeline from session
@@ -951,10 +928,12 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
     from sentinel.core.session_intelligence import EvidenceRef as _ERef, DisproveReason as _DR
 
     intel = getattr(session, '_session_intel', None)
+    _ev = None  # EvidenceRef constructed from real HTTP response — passed to Finding
 
     if state == FindingState.CONFIRMED:
         print(f"[PIPELINE] ✅ CONFIRMED: {url.split('/')[-1]} → {confirmed_bundle.promotion_reason}")
-        if intel and confirmed_bundle:
+        if confirmed_bundle:
+            # Construct from real pipeline response — not synthetic values
             _ev = _ERef(
                 method=method, url=url,
                 status_code=resp.status_code,
@@ -965,7 +944,8 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
                 record_count=confirmed_bundle.response.record_count,
                 proof_snippet=confirmed_bundle.response.proof_snippet,
             )
-            intel.record_confirmed(url, _ev)
+            if intel:
+                intel.record_confirmed(url, _ev)
 
     elif state == FindingState.REFUTED:
         print(f"[PIPELINE] ❌ REFUTED:   {negative.format().splitlines()[0]}")
@@ -995,17 +975,15 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
                 intel.record_inconclusive(url, reason=f"HTTP {status_code}")
 
     findings = _analyze_probe_response_with_evidence(
-        url, resp, artifact, probe.get("hypothesis", ""), state=state
+        url, resp, artifact, probe.get("hypothesis", ""), state=state,
+        evidence=_ev,
     )
 
-    # Calculate blast radius for confirmed findings — same as AlphaAgent.evaluate_result
+    # Calculate blast radius for confirmed findings
     if state == FindingState.CONFIRMED and findings:
-        dummy_alpha = AlphaAgent.__new__(AlphaAgent)
-        dummy_alpha.alpha_id = "QUEEN/ALPHA"
-        dummy_alpha.session = session
         for f in findings:
             if f.severity in (Severity.CRITICAL, Severity.HIGH):
-                dummy_alpha._calculate_blast_radius(f)
+                _measure_blast_radius(f, alpha_id="QUEEN/ALPHA")
 
     return findings
 
@@ -1013,10 +991,13 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
 def _analyze_probe_response_with_evidence(url: str, resp,
                                             artifact: EvidenceArtifact,
                                             hypothesis: str,
-                                            state: FindingState = FindingState.TESTED) -> list[Finding]:
+                                            state: FindingState = FindingState.TESTED,
+                                            evidence=None) -> list[Finding]:
     """
     Analyze probe response using pipeline state.
     Only creates findings for CONFIRMED state — pipeline enforces this.
+    evidence: Optional[EvidenceRef] constructed from the confirmed_bundle in execute_targeted_probe.
+              Attached directly to the Finding — no reconstruction needed.
     """
     status = resp.status_code
     er     = artifact.response
@@ -1045,7 +1026,9 @@ def _analyze_probe_response_with_evidence(url: str, resp,
     if er.sample:
         desc_parts.append(f"Sample (sanitized): {er.sample}")
 
-    severity = Severity.CRITICAL if (er.sensitive_fields and er.record_count) else                Severity.HIGH if (er.sensitive_fields or er.record_count) else                Severity.MEDIUM
+    severity = Severity.CRITICAL if (er.sensitive_fields and er.record_count) else \
+               Severity.HIGH if (er.sensitive_fields or er.record_count) else \
+               Severity.MEDIUM
 
     return [Finding(
         agent=AgentName.PROBE,
@@ -1053,6 +1036,7 @@ def _analyze_probe_response_with_evidence(url: str, resp,
         description=" ".join(desc_parts),
         severity=severity,
         file_path=url,
+        evidence=evidence,  # real EvidenceRef from pipeline — None if not CONFIRMED
         mitre_tactic="Collection",
         mitre_technique="T1213 — Data from Information Repositories",
         remediation=(
@@ -1061,6 +1045,40 @@ def _analyze_probe_response_with_evidence(url: str, resp,
             "Verify authorization server-side before returning data."
         ),
     )]
+
+
+def _measure_blast_radius(finding: Finding, alpha_id: str = "ALPHA") -> None:
+    """
+    Module-level blast radius measurement — no AlphaAgent instance required.
+    Writes measured result directly into finding.description.
+    TLS handling is managed by probe_with_evidence internally.
+    """
+    url = finding.file_path
+    if not url or not url.startswith("http"):
+        finding.description += "\n📊 Blast radius: unknown — no URL to probe"
+        return
+    try:
+        from sentinel.core.evidence import probe_with_evidence
+        resp, artifact = probe_with_evidence(url, auth_sent=False)
+
+        if resp and artifact.response.status_code == 200:
+            er = artifact.response
+            parts = []
+            if er.record_count is not None:
+                parts.append(f"{er.record_count} records returned")
+            if er.sensitive_fields:
+                parts.append(f"sensitive fields: {', '.join(er.sensitive_fields[:4])}")
+            if er.size_bytes:
+                parts.append(f"{er.size_bytes} bytes")
+            parts.append(f"type: {er.response_type}")
+
+            blast = "MEASURED: " + " | ".join(parts) if parts else f"response received ({er.size_bytes}b)"
+            finding.description += f"\n📊 Blast radius (measured): {blast}"
+            print(f"[{alpha_id}] 📊 Blast radius: {blast}")
+        else:
+            finding.description += "\n📊 Blast radius: endpoint returned no data"
+    except Exception:
+        finding.description += "\n📊 Blast radius: measurement failed"
 
 
 def _analyze_probe_response(url: str, resp, hypothesis: str) -> list[Finding]:

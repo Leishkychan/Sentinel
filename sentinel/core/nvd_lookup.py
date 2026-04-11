@@ -20,8 +20,7 @@ import hashlib
 from pathlib import Path
 from typing import Optional
 import requests
-from urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+# TLS warnings suppressed per-request in safe_request/probe_with_evidence
 
 # NVD API v2
 NVD_API_BASE  = "https://services.nvd.nist.gov/rest/json/cves/2.0"
@@ -57,7 +56,7 @@ def lookup_cves(product: str, version: str, max_results: int = 10) -> list[dict]
     }
 
     try:
-        resp = requests.get(NVD_API_BASE, params=params, timeout=15, verify=False)
+        resp = requests.get(NVD_API_BASE, params=params, timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             results = _parse_nvd_response(data)
@@ -85,7 +84,7 @@ def get_cve_details(cve_id: str) -> Optional[dict]:
     _rate_limit()
 
     try:
-        resp = requests.get(f"{NVD_CVE_BASE}/{cve_id}", timeout=15, verify=False)
+        resp = requests.get(f"{NVD_CVE_BASE}/{cve_id}", timeout=15)
         if resp.status_code == 200:
             data = resp.json()
             results = _parse_nvd_response(data)

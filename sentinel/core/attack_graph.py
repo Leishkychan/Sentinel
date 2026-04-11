@@ -321,7 +321,18 @@ class AttackGraph:
     # ── Private methods ───────────────────────────────────────────────────────
 
     def _classify_finding(self, url: str, evidence: str) -> Optional[str]:
-        """Classify a confirmed finding. Unauthenticated access takes priority."""
+        """
+        Classify a confirmed finding into a chain type.
+
+        Patterns are explicit — no catch-all. If no pattern matches, returns None
+        and no chain steps are generated for that finding.
+
+        API-like namespaces covered (all justified by existing codebase references):
+          /api/     — primary REST namespace, referenced throughout agents
+          /rest/    — secondary REST namespace, referenced throughout agents
+          /graphql  — referenced in Queen blocked patterns and validator
+          /v1/ /v2/ /v3/ — referenced in Queen blocked patterns as known version endpoints
+        """
         url_lower = url.lower()
         ev_lower  = evidence.lower()
 
@@ -341,19 +352,29 @@ class AttackGraph:
                 ("sql" in ev_lower and "error" in ev_lower and "syntax" in ev_lower)):
             return "sql_injection_condition"
 
-        # Unauthenticated API access — any confirmed JSON without auth
-        if "/api/" in url_lower or "/rest/" in url_lower:
+        # Unauthenticated API access — explicit API-like namespaces only
+        # /api/ and /rest/ are the primary namespaces in the codebase
+        # /graphql is referenced in Queen's blocked patterns and validator permissions
+        # /v1/ /v2/ /v3/ are referenced in Queen's blocked patterns as known API version paths
+        if ("/api/" in url_lower or
+                "/rest/" in url_lower or
+                "/graphql" in url_lower or
+                "/v1/" in url_lower or
+                "/v2/" in url_lower or
+                "/v3/" in url_lower):
             return "unauthenticated_api_access"
 
         # Rate limiting (standalone)
         if "rate" in ev_lower and "limit" in ev_lower:
             return "no_rate_limiting"
 
-        # Sensitive data (catch-all for non-API paths)
+        # Sensitive data — non-API paths where sensitive fields were explicitly confirmed
         if any(s in ev_lower for s in ["password", "token", "apikey", "secret"]):
             return "sensitive_data_exposure"
 
-        return "unauthenticated_api_access"
+        # No pattern matched — do not generate chain steps for unknown paths
+        # Prefer no classification over wrong classification
+        return None
 
     def _find_or_create_chain(
         self, finding_type: str, url: str

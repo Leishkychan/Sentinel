@@ -488,7 +488,7 @@ def map_finding(title: str, description: str) -> Optional[ControlMapping]:
         return STANDARDS_DB["sensitive_data_exposure"]
     if "header" in text and ("security" in text or "missing" in text):
         return STANDARDS_DB["missing_security_header"]
-    if "stack trace" in text or "error" in text and "disclose" in text:
+    if "stack trace" in text or ("error" in text and "disclose" in text):
         return STANDARDS_DB["information_disclosure_error"]
 
     return None

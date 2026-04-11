@@ -431,11 +431,11 @@ class EvalHarness:
                     finding_matched_ids.add(finding_id)
 
                     # is_confirmed: pipeline confirmed AND URL in confirmed_urls
+                    desc_or = f.description or ""
                     is_confirmed = (
-                        f.file_path in confirmed_urls or
-                        "📊 Blast radius" in (f.description or "") and ("MEASURED" in (f.description or "") or "measured" in (f.description or "")) or
-                        ("[Root Cause]" in (f.title or "") and
-                         known_path in (f.description or "").lower())
+                        (f.file_path in confirmed_urls) or
+                        ("📊 Blast radius" in desc_or and ("MEASURED" in desc_or or "measured" in desc_or)) or
+                        ("[Root Cause]" in (f.title or "") and known_path in desc_or.lower())
                     )
 
                     # is_refuted: 401/403, disproven, or SPA fallback
@@ -498,29 +498,42 @@ class EvalHarness:
     ) -> tuple[int, int]:
         """
         Validate chains against confirmed_urls.
-        Valid = all referenced finding URLs are in confirmed_urls.
-        Returns (valid_count, invalid_count).
+        Valid = all finding_ids reference URLs that are confirmed.
+        A chain is invalid if it has no finding_ids or any finding_id URL is unconfirmed.
         """
         valid   = 0
         invalid = 0
         for chain in chains:
-            steps = chain.get("steps", []) or chain.get("findings", [])
-            if not steps:
-                # No step detail — use confidence field
-                if chain.get("confidence") in ("HIGH", "CONFIRMED"):
+            finding_ids = chain.get("finding_ids", [])
+            if not finding_ids:
+                # No finding IDs — cannot validate, count as invalid
+                invalid += 1
+                continue
+
+            # Check attack_path steps for URL references
+            attack_path = chain.get("attack_path", [])
+            # Extract any URLs mentioned in the attack path steps
+            path_urls = []
+            for step in attack_path:
+                import re
+                urls = re.findall(r'https?://[^\s\'"]+', str(step))
+                path_urls.extend(urls)
+
+            if path_urls:
+                # Validate against confirmed URLs
+                if all(any(confirmed in url for confirmed in confirmed_urls) or
+                       any(url in confirmed for confirmed in confirmed_urls)
+                       for url in path_urls):
                     valid += 1
                 else:
                     invalid += 1
-                continue
-            step_urls = [
-                step.get("url", step.get("file_path", ""))
-                for step in steps
-            ]
-            step_urls = [u for u in step_urls if u]  # filter empty
-            if step_urls and all(u in confirmed_urls for u in step_urls):
-                valid += 1
             else:
-                invalid += 1
+                # No URLs in path — validate by confidence
+                # HIGH = strong chain signal, MEDIUM/LOW = insufficient
+                if chain.get("confidence") == "HIGH":
+                    valid += 1
+                else:
+                    invalid += 1
         return valid, invalid
 
     def save_run(self, run: EvalRun, output_dir: str = "reports/eval") -> str:

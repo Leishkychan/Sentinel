@@ -18,7 +18,8 @@ NEVER: exploits, writes, modifies anything
 
 import os
 import re
-import requests
+import requests  # for RequestException type only
+from sentinel.core.evidence import safe_request
 from pathlib import Path
 from urllib.parse import urljoin
 
@@ -127,8 +128,7 @@ def _check_http_headers(session: ScanSession, target_url: str) -> list[Finding]:
 
     findings = []
     try:
-        resp = requests.get(target_url, timeout=10, verify=False,
-                            headers={"User-Agent": "Sentinel-SecurityScanner/1.0"})
+        resp = safe_request("GET", target_url, timeout=10)
         headers = resp.headers
 
         # Check required security headers
@@ -210,8 +210,7 @@ def _check_exposed_paths(session: ScanSession, target_url: str) -> list[Finding]
     for path in ADMIN_PATHS:
         url = base + path
         try:
-            resp = requests.get(url, timeout=5, verify=False, allow_redirects=False,
-                                headers={"User-Agent": "Sentinel-SecurityScanner/1.0"})
+            resp = safe_request("GET", url, timeout=5, allow_redirects=False)
             if resp.status_code in (200, 301, 302, 403):
                 severity = Severity.CRITICAL if resp.status_code == 200 else Severity.MEDIUM
                 findings.append(Finding(

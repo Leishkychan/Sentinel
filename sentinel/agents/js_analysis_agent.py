@@ -18,10 +18,10 @@ NEVER: executes JavaScript, modifies anything, sends payloads
 
 import re
 import json
-import requests
+import requests  # for RequestException type only
+from sentinel.core.evidence import safe_request
 from urllib.parse import urljoin, urlparse
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+# TLS warnings suppressed per-request in safe_request/probe_with_evidence
 
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity,
@@ -96,7 +96,7 @@ def _discover_js_files(base: str) -> list[str]:
     """Fetch the main page and extract all JS file URLs."""
     js_urls = []
     try:
-        resp = requests.get(base, headers=HEADERS, timeout=TIMEOUT, verify=False)
+        resp = safe_request("GET", base, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code != 200:
             return js_urls
 
@@ -119,7 +119,7 @@ def _discover_js_files(base: str) -> list[str]:
         for path in common_js:
             url = base + path
             try:
-                r = requests.head(url, headers=HEADERS, timeout=5, verify=False)
+                r = safe_request("HEAD", url, headers=HEADERS, timeout=5)
                 if r.status_code == 200:
                     js_urls.append(url)
             except requests.RequestException:
@@ -134,7 +134,7 @@ def _discover_js_files(base: str) -> list[str]:
 def _fetch_js(url: str) -> str | None:
     """Fetch JS file content, skip if too large."""
     try:
-        resp = requests.get(url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+        resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code != 200:
             return None
         size_kb = len(resp.content) / 1024
@@ -156,7 +156,7 @@ def _check_source_map(js_url: str, session: ScanSession) -> list[Finding]:
     findings = []
     map_url = js_url + ".map"
     try:
-        resp = requests.get(map_url, headers=HEADERS, timeout=TIMEOUT, verify=False)
+        resp = safe_request("GET", map_url, headers=HEADERS, timeout=TIMEOUT)
         if resp.status_code == 200 and len(resp.content) > 100:
             try:
                 data = resp.json()
@@ -241,7 +241,7 @@ def _find_endpoints(content: str, js_url: str, base: str) -> list[Finding]:
         for ep in list(all_endpoints)[:20]:
             url = base + ep if ep.startswith("/") else ep
             try:
-                resp = requests.get(url, headers=HEADERS, timeout=5, verify=False)
+                resp = safe_request("GET", url, headers=HEADERS, timeout=5)
                 if resp.status_code == 200:
                     accessible.append(ep)
             except requests.RequestException:

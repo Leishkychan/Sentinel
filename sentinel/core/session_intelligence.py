@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime, timezone
 from enum import Enum
+from sentinel.core.models import EvidenceRef  # defined in models.py — shared with Finding
 
 
 # ── State definitions ─────────────────────────────────────────────────────────
@@ -72,55 +73,6 @@ class StopCondition(str, Enum):
 
 
 # ── Core data structures ──────────────────────────────────────────────────────
-
-@dataclass
-class EvidenceRef:
-    """Structured evidence object — not a summary string."""
-    method:          str
-    url:             str
-    status_code:     int
-    response_type:   str              # JSON | HTML | TEXT | EMPTY
-    size_bytes:      int
-    auth_sent:       bool
-    sensitive_fields: list[str]
-    record_count:    Optional[int]
-    proof_snippet:   Optional[str]    # Sanitized sample — required for CONFIRMED
-    timestamp:       str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-
-    def is_sufficient_for_confirmation(self) -> tuple[bool, str]:
-        """Hard check — is this evidence good enough to CONFIRM a finding?"""
-        if self.status_code != 200:
-            return False, f"HTTP {self.status_code} — only 200 confirms"
-        if self.response_type == "HTML":
-            return False, "HTML response — not structured data"
-        if self.response_type == "EMPTY":
-            return False, "Empty response — no evidence"
-        if self.size_bytes < 200:
-            return False, f"Too small ({self.size_bytes}b)"
-        if not self.proof_snippet:
-            return False, "No proof snippet — required"
-        if self.auth_sent:
-            return False, "Auth was sent — cannot confirm auth bypass"
-        return True, "OK"
-
-    def format(self) -> str:
-        auth_str = "YES — 401/403" if self.status_code in (401, 403) else \
-                   "NOT required" if not self.auth_sent and self.status_code == 200 else \
-                   "unknown"
-        parts = [
-            f"Request:  {self.method} {self.url}",
-            f"Status:   {self.status_code}",
-            f"Type:     {self.response_type} ({self.size_bytes}b)",
-            f"Auth req: {auth_str}",
-        ]
-        if self.record_count is not None:
-            parts.append(f"Records:  {self.record_count}")
-        if self.sensitive_fields:
-            parts.append(f"Sensitive: {', '.join(self.sensitive_fields[:4])}")
-        if self.proof_snippet:
-            parts.append(f"Proof:    {self.proof_snippet[:150]}")
-        return "\n".join(parts)
-
 
 @dataclass
 class EndpointRecord:
@@ -324,11 +276,23 @@ class SessionIntelligence:
 
     def record_confirmed(self, url: str, evidence: EvidenceRef,
                          confidence: float = 0.85) -> EndpointRecord:
-        """Register a confirmed finding with full evidence."""
+        """
+        Register a confirmed finding with full evidence.
+
+        Precedence rules (explicit):
+          CONFIRMED > DISPROVEN > INCONCLUSIVE
+          - If already CONFIRMED: no-op (idempotent)
+          - If previously DISPROVEN: allowed only with HTTP 200 + JSON evidence
+            (authentication was added, or endpoint was re-classified correctly)
+          - If previously INCONCLUSIVE: allowed — CONFIRMED outranks it
+        """
+        # Idempotent: already confirmed
+        if url in self.confirmed_urls:
+            return self.endpoints.get(url)
+
         # Validate evidence before accepting CONFIRMED state
         ok, reason = evidence.is_sufficient_for_confirmation()
         if not ok:
-            # Auto-downgrade to INCONCLUSIVE
             print(f"[INTEL] ⚠ Cannot CONFIRM {url}: {reason} — downgrading to INCONCLUSIVE")
             return self.record_inconclusive(url, evidence, f"Evidence insufficient: {reason}")
 
@@ -351,6 +315,13 @@ class SessionIntelligence:
         )
         self.endpoints[url] = ep
         self.confirmed_urls.add(url)
+        # Enforce mutual exclusivity — URL must be in exactly one outcome set
+        # CONFIRMED outranks all weaker states: remove from both
+        self.disproven_urls.discard(url)
+        self.inconclusive_urls.discard(url)
+        # ARCHITECTURAL NOTE: budget tracks classification events, not raw HTTP requests.
+        # With duplicate guards in place, this approximates request count (1 write per URL).
+        # True request count tracking requires instrumentation at the HTTP layer.
         self.budget_used += 1
         # Remove from untested queue if present
         if url in self.untested_queue:
@@ -388,19 +359,41 @@ class SessionIntelligence:
     def record_disproven(self, url: str, reason: DisproveReason,
                          evidence: Optional[EvidenceRef] = None,
                          status_code: int = 0) -> EndpointRecord:
-        """Register a disproven endpoint with reason and retest policy."""
+        """
+        Register a disproven endpoint.
+
+        Precedence rules (explicit):
+          - CONFIRMED outranks DISPROVEN — never overwrite a confirmed finding
+          - DISPROVEN is idempotent — already disproven returns existing record
+          - INCONCLUSIVE → DISPROVEN allowed (stronger negative signal)
+        """
+        # CONFIRMED outranks DISPROVEN — this endpoint has real data, don't overwrite
+        if url in self.confirmed_urls:
+            return self.endpoints.get(url)
+
+        # Idempotent: already disproven
+        if url in self.disproven_urls:
+            ep = self.endpoints.get(url)
+            if ep is None:
+                # State integrity issue: in disproven_urls but not in endpoints
+                # Log and return None — do NOT fall through and create a new record.
+                # Falling through would re-increment budget_used and re-add to disproven_urls.
+                print(f"[INTEL] ⚠ State integrity: {url} in disproven_urls but missing from endpoints")
+                return None
+            return ep
+
         retest = self._get_retest_policy(reason)
         auth_behavior = AuthBehavior.REQUIRES_AUTH if reason == DisproveReason.AUTH_ENFORCED else \
                         AuthBehavior.AUTH_IRRELEVANT if reason == DisproveReason.SPA_FALLBACK else \
                         AuthBehavior.UNKNOWN
 
         reason_text = {
-            DisproveReason.AUTH_ENFORCED: f"HTTP 401/403 — authentication enforced, access control working",
-            DisproveReason.SPA_FALLBACK:  f"SPA shell (~75KB HTML) — client-side route, no server data",
-            DisproveReason.NOT_FOUND:     f"HTTP 404 — endpoint does not exist",
-            DisproveReason.EMPTY_RESPONSE: f"Response too small — no meaningful content",
-            DisproveReason.SERVER_ERROR:  f"HTTP 5xx — server error, endpoint broken not vulnerable",
-            DisproveReason.NO_RESPONSE:   f"Connection failed — endpoint unreachable",
+            DisproveReason.AUTH_ENFORCED:  "HTTP 401/403 — authentication enforced, access control working",
+            DisproveReason.SPA_FALLBACK:   "SPA shell (~75KB HTML) — client-side route, no server data",
+            DisproveReason.NOT_FOUND:      "HTTP 404 — endpoint does not exist",
+            DisproveReason.EMPTY_RESPONSE: "Response too small — no meaningful content",
+            DisproveReason.SERVER_ERROR:   "HTTP 5xx — server error, endpoint broken not vulnerable",
+            DisproveReason.NO_RESPONSE:    "Connection failed — endpoint unreachable",
         }.get(reason, reason.value)
 
         ep = EndpointRecord(
@@ -412,18 +405,46 @@ class SessionIntelligence:
             retest_policy=retest,
             classification_reason=reason_text,
             cycle_discovered=self.current_cycle,
-            confidence=0.90,  # High confidence we know this is NOT vulnerable
+            confidence=0.90,
             chain_candidate=False,
         )
         self.endpoints[url] = ep
         self.disproven_urls.add(url)
+        # Remove from inconclusive tracking if promoted to disproven
+        self.inconclusive_urls.discard(url)
+        # Remove from queue — settled endpoints must not linger as pending work
+        if url in self.untested_queue:
+            self.untested_queue.remove(url)
+        # ARCHITECTURAL NOTE: budget tracks classification events, not raw HTTP requests.
+        # With duplicate guards in place, this approximates request count (1 write per URL).
+        # True request count tracking requires instrumentation at the HTTP layer.
         self.budget_used += 1
         return ep
 
     def record_inconclusive(self, url: str,
                              evidence: Optional[EvidenceRef] = None,
                              reason: str = "HTTP 500 or ambiguous") -> EndpointRecord:
-        """Register an inconclusive probe."""
+        """
+        Register an inconclusive probe.
+
+        Precedence rules (explicit):
+          INCONCLUSIVE is the weakest state — never overwrites settled state
+          - CONFIRMED → stays CONFIRMED (INCONCLUSIVE is ignored)
+          - DISPROVEN  → stays DISPROVEN (INCONCLUSIVE is ignored)
+          - INCONCLUSIVE → count incremented, retry policy applied
+        """
+        # Remove from queue immediately — no longer pending regardless of outcome
+        if url in self.untested_queue:
+            self.untested_queue.remove(url)
+
+        # CONFIRMED outranks INCONCLUSIVE — don't overwrite
+        if url in self.confirmed_urls:
+            return self.endpoints.get(url)
+
+        # DISPROVEN outranks INCONCLUSIVE — don't overwrite
+        if url in self.disproven_urls:
+            return self.endpoints.get(url)
+
         ep = EndpointRecord(
             url=url,
             outcome=ProbeOutcome.INCONCLUSIVE,
@@ -434,11 +455,14 @@ class SessionIntelligence:
             classification_reason=reason,
             cycle_discovered=self.current_cycle,
             confidence=0.30,
-            chain_candidate=False,  # Cannot chain inconclusive
+            chain_candidate=False,
         )
         self.endpoints[url] = ep
         self.inconclusive_urls.add(url)
         self.inconclusive_counts[url] = self.inconclusive_counts.get(url, 0) + 1
+        # ARCHITECTURAL NOTE: budget tracks classification events, not raw HTTP requests.
+        # With duplicate guards in place, this approximates request count (1 write per URL).
+        # True request count tracking requires instrumentation at the HTTP layer.
         self.budget_used += 1
         return ep
 
@@ -604,10 +628,20 @@ class SessionIntelligence:
             self.stop_condition = StopCondition.BUDGET_EXHAUSTED
             return
 
-        # If we have 5+ confirmed findings with chain candidates — sufficient evidence
-        if len(self.confirmed_urls) >= 5 and len(self.chain_candidates) >= 2:
+        # Sufficient evidence — based on confirmed finding count and severity
+        # Rules (code matches comment exactly):
+        #   2+ confirmed with HIGH/CRITICAL severity → sufficient
+        #   5+ confirmed (any severity) with 2+ chain candidates → sufficient
+        confirmed_high_or_critical = sum(
+            1 for rc in self.root_causes
+            if getattr(rc, 'severity', '') == 'CRITICAL'
+            or getattr(rc, 'severity', '') == 'HIGH'
+        )
+        if confirmed_high_or_critical >= 2 and len(self.chain_candidates) >= 1:
             self.stop_condition = StopCondition.SUFFICIENT_EVIDENCE
-            # Don't stop — but signal Queen
+        elif len(self.confirmed_urls) >= 5 and len(self.chain_candidates) >= 2:
+            self.stop_condition = StopCondition.SUFFICIENT_EVIDENCE
+        # Don't stop execution — signal Queen to consider concluding
 
     def should_stop(self) -> tuple[bool, str]:
         """Should the investigation end?"""
@@ -680,6 +714,15 @@ class SessionIntelligence:
             self.queen_objectives_failed.append(objective[:120])
 
     def _objectives_similar(self, obj1: str, obj2: str) -> bool:
+        # Objectives covering different explicit namespaces are never similar
+        # /rest/admin/ and /api/ are different attack surfaces
+        NAMESPACES = ['/api/', '/rest/admin/', '/rest/products/',
+                      '/rest/user/', '/graphql', '/admin/']
+        ns1 = {ns for ns in NAMESPACES if ns in obj1}
+        ns2 = {ns for ns in NAMESPACES if ns in obj2}
+        if ns1 and ns2 and ns1 != ns2:
+            return False  # Different namespaces — always allow both
+
         skip = {"test", "exploit", "enumerate", "attempt", "analyze",
                 "probe", "check", "verify", "confirm", "investigate"}
         def key_terms(obj: str) -> set:
@@ -776,6 +819,25 @@ class SessionIntelligence:
             lines.append(f"\nCOMPLETED OBJECTIVES (do not repeat):")
             for obj in self.queen_objectives_completed[-6:]:
                 lines.append(f"  ✓ {obj[:90]}")
+
+        # Show untested endpoints grouped by namespace — Queen uses this to
+        # generate targeted objectives instead of repeating generic ones
+        if self.untested_queue:
+            # Group by namespace prefix
+            from collections import defaultdict
+            by_ns: dict = defaultdict(list)
+            for url in self.untested_queue:
+                from urllib.parse import urlparse
+                path = urlparse(url).path
+                parts = [p for p in path.split('/') if p]
+                ns = '/' + parts[0] + '/' if parts else '/'
+                by_ns[ns].append(url)
+
+            lines.append(f"\nUNTESTED ENDPOINTS REMAINING ({len(self.untested_queue)} total):")
+            for ns, urls in sorted(by_ns.items()):
+                sample = [u.split('/')[-1] for u in urls[:4]]
+                lines.append(f"  {ns} — {len(urls)} remaining: {', '.join(sample)}"
+                             + ('...' if len(urls) > 4 else ''))
 
         if self.root_causes:
             lines.append(f"\nROOT CAUSES IDENTIFIED:")

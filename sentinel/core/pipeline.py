@@ -286,8 +286,12 @@ class FindingPipeline:
         # Determine response type
         rtype = self._classify_response(content, ctype, size)
 
-        # Count records
-        record_count  = self._count_records(content, rtype)
+        # Count records — prefer pre-computed count from artifact (full response)
+        # over re-parsing truncated content (which fails on large responses)
+        record_count = (
+            response_data.get("record_count")       # pre-computed from full response
+            or self._count_records(content, rtype)  # fallback: parse truncated content
+        )
         sensitive     = self._find_sensitive_fields(content)
         proof_snippet = self._build_proof(content, rtype, status, sensitive)
 
@@ -368,10 +372,22 @@ class FindingPipeline:
             )
             return FindingState.TESTED, bundle, None
 
-        # INCONCLUSIVE: server error — endpoint broken, not proven safe
-        # 500 means the server failed, NOT that the endpoint is secure
-        # Return TESTED so session_intel records it as inconclusive
+        # 500 handling: distinguish "route doesn't exist" from "server broken"
         if status >= 500:
+            # "Unexpected path: /api/X" in body = route not registered = equivalent to 404
+            # This is a strong negative signal — the endpoint doesn't exist on this server
+            if "unexpected path" in content.lower() or "cannot get" in content.lower():
+                neg = NegativeValidation(
+                    endpoint=url, method=method,
+                    reason=RefutedReason.NOT_FOUND,
+                    evidence=EvidenceBundle(req, resp, FindingState.REFUTED,
+                                            f"HTTP 500 with route-not-found body — endpoint does not exist",
+                                            RefutedReason.NOT_FOUND),
+                )
+                self.refuted.append(neg)
+                return FindingState.REFUTED, None, neg
+
+            # Genuine server error — inconclusive, not proven safe
             bundle = EvidenceBundle(
                 request=req,
                 response=resp,
@@ -604,33 +620,38 @@ class PromotionRules:
         return True, "OK"
 
     @staticmethod
-    def can_promote_to_confirmed(response: ResponseRecord) -> tuple[bool, str]:
+    def can_promote_to_confirmed(response: ResponseRecord,
+                                  auth_sent: bool = False) -> tuple[bool, str]:
         """
         TESTED → CONFIRMED requires ALL of:
           - HTTP 200
           - Response type is JSON (not HTML/EMPTY)
           - proof_snippet is non-empty
           - size > 200 bytes
-          - auth was NOT sent
+          - auth was NOT sent (auth_sent must be False)
           - NOT a SPA shell
-        
+
         Fails IMMEDIATELY if any criterion is missing.
+        auth_sent defaults to False for backwards compatibility with validate_evidence_bundle.
         """
         if response.status_code != 200:
             return False, f"Status {response.status_code} — only HTTP 200 can be CONFIRMED"
-        
+
         if response.response_type == "HTML":
             return False, "HTML response — not structured data, cannot CONFIRM"
-        
+
         if response.response_type == "EMPTY":
             return False, "Empty response — no evidence, cannot CONFIRM"
-        
+
         if response.size_bytes < 200:
             return False, f"Response too small ({response.size_bytes}b) — insufficient evidence"
-        
+
         if not response.proof_snippet:
             return False, "No proof snippet — evidence required for CONFIRMED state"
-        
+
+        if auth_sent:
+            return False, "Auth was sent — cannot confirm auth bypass"
+
         return True, "OK"
 
     @staticmethod

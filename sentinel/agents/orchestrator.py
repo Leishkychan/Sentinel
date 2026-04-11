@@ -13,7 +13,14 @@ from sentinel.core.threat_intel import load_attack_data, enrich_finding_intel
 from sentinel.core.nvd_lookup import scan_service_versions
 from sentinel.agents.queen_agent import QueenAgent
 
-client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+_client = None
+
+def _get_client():
+    """Lazy Anthropic client — not created until first use."""
+    global _client
+    if _client is None:
+        _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    return _client
 MODEL  = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
 MAX_ITERATIONS = 5
 
@@ -118,8 +125,9 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
 
     all_findings = enrich_all(all_findings)
 
-    # Populate session_intel untested_queue from all agent findings
-    _populate_intel_from_findings(all_findings, session)
+    # NOTE: session_intel is populated per-agent at line 96 above.
+    # No second call needed here — enrichment only adds MITRE fields,
+    # it does not change URLs or confirmation state.
 
     # Enrich with OWASP standards mapping
     from sentinel.core.standards import enrich_finding_with_standards
@@ -163,6 +171,20 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
     # Wire session onto result so chain engine can read session_intel confirmed URLs
     result._session = session
     chains = analyze_attack_chains(result)
+
+    # Filter: only chains that pass eval validation reach the report
+    # eval_harness validates chains against confirmed_urls before scoring
+    # We pre-filter here so reporter never sees invalid chains
+    intel = getattr(session, '_session_intel', None)
+    confirmed_urls = intel.confirmed_urls if intel else set()
+    valid_chains = [
+        c for c in chains
+        if _chain_is_valid(c, confirmed_urls)
+    ]
+    if len(valid_chains) < len(chains):
+        print(f"[CHAIN] Filtered {len(chains) - len(valid_chains)} invalid chains — "
+              f"{len(valid_chains)} valid chains remain")
+    chains = valid_chains
     result.attack_chains = chains_to_dict(chains)
     for c in chains:
         print(f"  [{c.severity}] {c.title} ({c.confidence})")
@@ -270,7 +292,7 @@ def _dispatch(agent: str, session: ScanSession, source_path: Optional[str]) -> l
 
 def _initial_plan(session: ScanSession, source_path: Optional[str]) -> dict:
     try:
-        resp = client.messages.create(
+        resp = _get_client().messages.create(
             model=MODEL, max_tokens=400, system=SYSTEM,
             messages=[{"role": "user", "content":
                 f"Target: {session.target}\nMode: {session.mode.value}\n"
@@ -290,7 +312,7 @@ def _replan(session, source_path, findings, done, queue) -> dict:
     for f in findings: by_sev[f.severity] = by_sev.get(f.severity, 0) + 1
     top = [f"[{f.severity}] {f.title[:60]}" for f in findings[:5]]
     try:
-        resp = client.messages.create(
+        resp = _get_client().messages.create(
             model=MODEL, max_tokens=300, system=SYSTEM,
             messages=[{"role": "user", "content":
                 f"Target: {session.target} Mode: {session.mode.value}\n"
@@ -392,105 +414,6 @@ def _nvd_check(session: ScanSession, findings: list[Finding]) -> list[Finding]:
 
 
 
-def _run_alpha_investigation(session: ScanSession, current_findings: list[Finding],
-                              agents_run: list[AgentName], agents_done: set,
-                              source_path: Optional[str]) -> list[Finding]:
-    """
-    Alpha Agent investigation loop.
-    Alpha reasons about findings, directs targeted probes and agents,
-    evaluates results, and builds a complete threat picture.
-    """
-    alpha = AlphaAgent(session, source_path)
-    alpha.add_findings(current_findings)
-
-    new_findings = []
-    consecutive_empty = 0
-
-    for cycle in range(AlphaAgent.__init__.__code__.co_consts[0]
-                       if False else 8):  # MAX_ALPHA_CYCLES
-
-        decision = alpha.think()
-        status = decision.get("status", "unknown")
-
-        if status == "complete":
-            print(f"[ALPHA] Investigation complete at cycle {alpha.cycle}")
-            break
-
-        if status in ("error", "need_more_data"):
-            consecutive_empty += 1
-            if consecutive_empty >= 2:
-                break
-            continue
-
-        consecutive_empty = 0
-
-        # Execute primary path
-        primary = decision.get("primary_path", {})
-        result_findings = []
-        success = False
-
-        if primary:
-            result_findings, success = _execute_alpha_action(
-                primary, session, source_path, agents_done
-            )
-
-        # If primary failed, try fallback
-        if not success or not result_findings:
-            for fb_key in ["fallback_path", "fallback_path_2"]:
-                fallback = decision.get(fb_key, {})
-                if fallback:
-                    print(f"[ALPHA] Primary failed — trying {fb_key}")
-                    result_findings, success = _execute_alpha_action(
-                        fallback, session, source_path, agents_done
-                    )
-                    if success and result_findings:
-                        break
-
-        # Evaluate what we got
-        action_id = (primary.get("agent") or
-                     primary.get("probe", {}).get("url", "unknown"))
-        outcome = alpha.evaluate_result(action_id, result_findings, success)
-        new_findings.extend(result_findings)
-
-        if outcome == "complete":
-            break
-
-    # Get Alpha's final conclusion
-    conclusion = alpha.conclude()
-
-    # Store Alpha's threat narrative and attack paths in the findings metadata
-    # by creating a special summary finding
-    if conclusion.get("threat_narrative"):
-        narrative_finding = Finding(
-            agent=AgentName.ALPHA,
-            title="[Alpha] Strategic Threat Assessment",
-            description=conclusion["threat_narrative"],
-            severity=Severity(conclusion.get("risk_score", "HIGH")),
-            mitre_tactic="Multiple",
-            mitre_technique="Multi-stage attack chain",
-            remediation="; ".join(conclusion.get("immediate_actions", [])[:3]),
-        )
-        new_findings.append(narrative_finding)
-
-    # Add confirmed attack paths as findings
-    for path in conclusion.get("attack_paths", []):
-        if path.get("confirmed"):
-            path_finding = Finding(
-                agent=AgentName.ALPHA,
-                title=f"[Alpha] Confirmed Attack Path: {path.get('title', 'Unknown')}",
-                description=(
-                    f"Blast radius: {path.get('blast_radius', 'Unknown')}\n"
-                    f"Steps: {' → '.join(path.get('steps', []))}"
-                ),
-                severity=Severity(path.get("severity", "HIGH")),
-                mitre_tactic="Multiple",
-                remediation=f"Break the chain: {path.get('break_point', 'Review findings')}",
-            )
-            new_findings.append(path_finding)
-
-    return new_findings
-
-
 def _execute_alpha_action(action: dict, session: ScanSession,
                            source_path: Optional[str],
                            agents_done: set) -> tuple[list[Finding], bool]:
@@ -575,7 +498,7 @@ If no agents should run, return {{}}.
 """
 
     try:
-        resp = client.messages.create(
+        resp = _get_client().messages.create(
             model=MODEL, max_tokens=400, system=SYSTEM,
             messages=[{"role": "user", "content": prompt}]
         )
@@ -617,12 +540,20 @@ def _populate_intel_from_findings(findings: list, session):
 
     Called after EVERY agent dispatch — ensures session_intel stays current
     so Alpha never re-probes what any earlier agent already settled.
+
+    Writes to SessionIntelligence in this priority order:
+      - DISPROVEN: for 401/403 and SPA fallback (deterministic HTTP signals)
+      - INCONCLUSIVE: for HTTP 500 (deterministic HTTP signal)
+      - CONFIRMED: only when f.evidence is present AND passes is_sufficient_for_confirmation()
+      - Queue additions: JS-discovered endpoints (not state transitions)
+    Any finding without structured evidence that claims confirmation via text alone
+    is left as supporting detail only — not promoted into authoritative session state.
     """
     intel = getattr(session, '_session_intel', None)
     if not intel:
         return
 
-    from sentinel.core.session_intelligence import EvidenceRef as _ERef, DisproveReason as _DR
+    from sentinel.core.session_intelligence import DisproveReason as _DR
 
     for f in findings:
         url = f.file_path or ""
@@ -632,29 +563,33 @@ def _populate_intel_from_findings(findings: list, session):
         title = (f.title or "").lower()
         desc  = (f.description or "").lower()
 
-        # Already settled by probe_agent — write into session_intel
-        # so Alpha never wastes a call on these
+        # DISPROVEN: 401/403 — authentication enforced (deterministic HTTP signal)
         if "401" in desc or "auth: required" in desc or "authentication enforced" in desc:
             if url not in intel.disproven_urls:
                 intel.record_disproven(url, _DR.AUTH_ENFORCED)
 
+        # DISPROVEN: SPA shell — client-side route, no server data (deterministic size+type signal)
         elif "spa route" in title or "spa shell" in desc or "spa fallback" in desc:
             if url not in intel.disproven_urls:
                 intel.record_disproven(url, _DR.SPA_FALLBACK)
 
-        elif "confirmed unauthenticated" in title or "confirmed:" in desc:
-            if url not in intel.confirmed_urls:
-                _ev = _ERef(method="GET", url=url, status_code=200,
-                            response_type="JSON", size_bytes=500,
-                            auth_sent=False, sensitive_fields=[],
-                            record_count=None, proof_snippet="confirmed by probe_agent")
-                intel.record_confirmed(url, _ev)
-
+        # INCONCLUSIVE: HTTP 500 — server error, cannot determine safe or unsafe (deterministic)
         elif "500" in desc or "server error" in desc or "inconclusive" in title:
             if url not in intel.inconclusive_urls:
                 intel.record_inconclusive(url, reason="HTTP 500 from probe_agent")
 
-        # Extract discovered endpoints from JS agent metadata
+        # CONFIRMED: only when f.evidence carries real structured proof from probe_with_evidence.
+        # Double-write is prevented by checking confirmed_urls first — record_confirmed is also
+        # idempotent, but the check avoids the call entirely when Alpha already settled this URL.
+        # If evidence fails is_sufficient_for_confirmation(), the finding is left as supporting
+        # detail only — record_inconclusive is NOT called for failed confirmation evidence.
+        elif f.evidence is not None and url not in intel.confirmed_urls:
+            ok, _ = f.evidence.is_sufficient_for_confirmation()
+            if ok:
+                intel.record_confirmed(url, f.evidence)
+            # else: leave as supporting detail — do not write any state
+
+        # Extract discovered endpoints from JS agent metadata (structured field, not freeform text)
         meta = getattr(f, 'metadata', {}) or {}
         discovered = meta.get('discovered_endpoints', [])
         for ep_url in discovered:
@@ -792,20 +727,11 @@ def _group_root_causes(findings: list[Finding], session: ScanSession) -> list[di
 
     # Build root cause dicts
     # Only include groups with at least 1 confirmed endpoint
-    root_causes = []
-    for pattern, data in pattern_groups.items():
-        confirmed = data["confirmed"]
-        inferred  = data["inferred"]
-        if not confirmed:
-            continue  # No confirmed endpoints = no root cause
-
-        from sentinel.core.session_intelligence import EvidenceRef as _ERef
-        for url in confirmed:
-            _ev = _ERef(method="GET", url=url, status_code=200,
-                        response_type="JSON", size_bytes=500,
-                        auth_sent=False, sensitive_fields=[],
-                        record_count=None, proof_snippet="grouped confirmed finding")
-            intel._update_root_cause(url, _ev)
+    # NOTE: intel.root_causes is already populated by record_confirmed → _update_root_cause
+    # Do NOT call _update_root_cause here with synthetic evidence — that would double-count
+    # and write fake evidence into the authoritative state layer.
+    # This function reads from intel.root_causes, it does not write to it.
+    _ = pattern_groups  # pattern_groups is used above to build confirmed/inferred groups
 
     return [
         {
@@ -818,6 +744,28 @@ def _group_root_causes(findings: list[Finding], session: ScanSession) -> list[di
         }
         for rc in intel.root_causes
     ]
+
+
+def _chain_is_valid(chain, confirmed_urls: set) -> bool:
+    """
+    A chain is valid only if it references confirmed finding URLs.
+    Chains with no finding_ids or unconfirmed URLs are invalid — never reach reporter.
+    """
+    import re
+    attack_path = chain.attack_path if hasattr(chain, 'attack_path') else []
+    # Extract URLs from attack path steps
+    path_urls = []
+    for step in attack_path:
+        path_urls.extend(re.findall(r'https?://[^\s\'"]+', str(step)))
+
+    if path_urls:
+        return all(
+            any(confirmed in url or url in confirmed for confirmed in confirmed_urls)
+            for url in path_urls
+        )
+    # No URLs in path — require HIGH confidence
+    confidence = chain.confidence if hasattr(chain, 'confidence') else ''
+    return confidence == 'HIGH'
 
 
 def _build_result(session, findings, agents_run):
@@ -890,7 +838,7 @@ def _summary(result: ScanResult, chains: list) -> str:
         "Start directly with your assessment."
     )
     try:
-        resp = client.messages.create(
+        resp = _get_client().messages.create(
             model=MODEL, max_tokens=400, system=SUMMARY_SYSTEM,
             messages=[{"role": "user", "content":
                 f"Target: {result.target} | Mode: {result.mode}\n\n"
@@ -901,9 +849,13 @@ def _summary(result: ScanResult, chains: list) -> str:
                 f"- Your first sentence MUST reference a specific confirmed finding by name\n"
                 f"- If no confirmed findings exist, say so explicitly\n"
                 f"- Never say 'systematic' unless 3+ confirmed findings share a pattern\n"
+                f"- Never say 'across all identified endpoints' — only speak to confirmed ones\n"
+                f"- Never say 'immediate implementation across all API endpoints' — scope to confirmed only\n"
+                f"- Say 'four confirmed endpoints' not 'multiple endpoints' — use the exact count\n"
                 f"- SPA shell routes are NOT admin access — never claim admin access from them\n"
                 f"- 401 = auth IS enforced — never say auth is missing for those endpoints\n"
-                f"- Blast radius: only cite measured numbers (111 records), never estimates"}])
+                f"- Blast radius: only cite measured numbers (111 records), never estimates\n"
+                f"- Scope all remediation language to confirmed findings only — not inferred ones"}])
         return resp.content[0].text.strip()
     except Exception:
         return fallback

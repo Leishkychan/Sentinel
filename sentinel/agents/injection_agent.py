@@ -28,8 +28,7 @@ import json
 import hashlib
 import requests
 from urllib.parse import urljoin, urlparse, urlencode
-from requests.packages.urllib3.exceptions import InsecureRequestWarning
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+# TLS warnings suppressed per-request in safe_request/probe_with_evidence
 
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity, ScanMode,
