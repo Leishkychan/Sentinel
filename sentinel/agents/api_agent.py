@@ -19,7 +19,7 @@ NEVER: mutates data, sends malicious payloads, exploits
 import json
 import re
 import requests  # for RequestException type only
-from sentinel.core.evidence import safe_request
+from sentinel.core.evidence import safe_request, classify_failure
 
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity,
@@ -50,6 +50,23 @@ INTROSPECTION_CHECK = {
     "query": "{ __typename }"
 }
 
+_AGENT = "api_agent"
+
+
+def _record_failure(session: ScanSession, url: str,
+                    failure_class: str = "other",
+                    failure_reason: str = "") -> None:
+    """
+    Route request failure to SessionIntelligence.record_request_failure().
+
+    After 7b: call sites pass resp.failure_class and resp.failure_reason
+    directly from FailedResponse. classify_failure still available for
+    requests.RequestException catch paths.
+    """
+    intel = getattr(session, '_session_intel', None)
+    if intel is not None:
+        intel.record_request_failure(_AGENT, url, failure_class, failure_reason)
+
 
 def run_api_agent(session: ScanSession, target_url: str) -> list[Finding]:
     """Run API security analysis."""
@@ -78,9 +95,20 @@ def _check_graphql(base: str, session: ScanSession) -> list[Finding]:
     for path in GRAPHQL_PATHS:
         url = base + path
 
-        # Check if GraphQL endpoint exists
         try:
-            resp = safe_request("POST", url, headers={**HEADERS, "Content-Type": "application/json"}, timeout=TIMEOUT, json=INTROSPECTION_CHECK)
+            resp = safe_request(
+                "POST", url,
+                headers={**HEADERS, "Content-Type": "application/json"},
+                timeout=TIMEOUT,
+                json=INTROSPECTION_CHECK,
+            )
+
+            # 7b: FailedResponse is falsy — safe_request never returns None after 7b
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", ""))
+                continue
 
             if resp.status_code not in (200, 400):
                 continue
@@ -90,7 +118,6 @@ def _check_graphql(base: str, session: ScanSession) -> list[Finding]:
             except (json.JSONDecodeError, ValueError):
                 continue
 
-            # GraphQL endpoint confirmed
             if "data" in data or "errors" in data:
                 findings.append(Finding(
                     agent=AgentName.API,
@@ -112,24 +139,40 @@ def _check_graphql(base: str, session: ScanSession) -> list[Finding]:
                     ),
                 ))
 
-                # Now test full introspection
-                intro_resp = safe_request("POST", url, headers={**HEADERS, "Content-Type": "application/json"}, timeout=TIMEOUT, json=INTROSPECTION_QUERY)
+                # Test full introspection
+                intro_resp = safe_request(
+                    "POST", url,
+                    headers={**HEADERS, "Content-Type": "application/json"},
+                    timeout=TIMEOUT,
+                    json=INTROSPECTION_QUERY,
+                )
+
+                # 7b: FailedResponse is falsy
+                if not intro_resp:
+                    _record_failure(session, url,
+                                    getattr(intro_resp, "failure_class", "other"),
+                                    getattr(intro_resp, "failure_reason", ""))
+                    continue
 
                 if intro_resp.status_code == 200:
                     try:
                         intro_data = intro_resp.json()
-                        types = intro_data.get("data", {}).get("__schema", {}).get("types", [])
+                        types = (intro_data.get("data", {})
+                                           .get("__schema", {})
+                                           .get("types", []))
                         if types:
-                            type_names = [t["name"] for t in types if not t["name"].startswith("__")]
+                            type_names = [t["name"] for t in types
+                                          if not t["name"].startswith("__")]
                             findings.append(Finding(
                                 agent=AgentName.API,
                                 title="GraphQL Introspection Enabled — Full Schema Exposed",
                                 description=(
                                     f"GraphQL introspection is ENABLED at {url}. "
-                                    f"Full schema with {len(type_names)} types is publicly accessible. "
+                                    f"Full schema with {len(type_names)} types is publicly "
+                                    f"accessible. "
                                     f"Types include: {', '.join(type_names[:10])}... "
-                                    "Attackers can map the entire API schema including all queries, "
-                                    "mutations, and data types."
+                                    "Attackers can map the entire API schema including all "
+                                    "queries, mutations, and data types."
                                 ),
                                 severity=Severity.HIGH,
                                 file_path=url,
@@ -145,7 +188,8 @@ def _check_graphql(base: str, session: ScanSession) -> list[Finding]:
                     except (json.JSONDecodeError, ValueError):
                         pass
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
@@ -160,7 +204,15 @@ def _check_api_docs(base: str, session: ScanSession) -> list[Finding]:
     for path in API_DOC_PATHS:
         url = base + path
         try:
-            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
+                                allow_redirects=False)
+
+            # 7b: FailedResponse is falsy — safe_request never returns None after 7b
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", ""))
+                continue
 
             if resp.status_code != 200:
                 continue
@@ -172,7 +224,6 @@ def _check_api_docs(base: str, session: ScanSession) -> list[Finding]:
             if "json" in content_type or path.endswith(".json"):
                 try:
                     data = resp.json()
-                    # Check for OpenAPI/Swagger structure
                     if "swagger" in data or "openapi" in data or "paths" in data:
                         is_api_doc = True
                         paths = data.get("paths", {})
@@ -192,7 +243,8 @@ def _check_api_docs(base: str, session: ScanSession) -> list[Finding]:
                     description=(
                         f"API documentation accessible at {url}. "
                         f"Exposes complete API structure to unauthenticated users. "
-                        + (f"Found {len(endpoints_found)} endpoints: {', '.join(endpoints_found[:5])}..."
+                        + (f"Found {len(endpoints_found)} endpoints: "
+                           f"{', '.join(endpoints_found[:5])}..."
                            if endpoints_found else "")
                     ),
                     severity=Severity.MEDIUM,
@@ -206,7 +258,8 @@ def _check_api_docs(base: str, session: ScanSession) -> list[Finding]:
                     ),
                 ))
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
@@ -229,11 +282,22 @@ def _check_api_versioning(base: str, session: ScanSession) -> list[Finding]:
         for path in paths:
             url = base + path
             try:
-                resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
+                resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
+                                    allow_redirects=False)
+
+                # 7b: FailedResponse is falsy
+                if not resp:
+                    _record_failure(session, url,
+                                    getattr(resp, "failure_class", "other"),
+                                    getattr(resp, "failure_reason", ""))
+                    continue
+
                 if resp.status_code in (200, 401, 403):
                     accessible_versions.append(version)
                     break
-            except requests.RequestException:
+
+            except requests.RequestException as e:
+                _record_failure(session, url, classify_failure(str(e)), str(e))
                 continue
 
     if len(accessible_versions) > 1:
@@ -251,7 +315,8 @@ def _check_api_versioning(base: str, session: ScanSession) -> list[Finding]:
             mitre_technique="T1190 — Exploit Public-Facing Application",
             remediation=(
                 "Decommission old API versions. "
-                "If backward compatibility is needed, ensure all versions have identical security controls. "
+                "If backward compatibility is needed, ensure all versions have identical "
+                "security controls. "
                 "Implement a deprecation timeline and force clients to upgrade."
             ),
         ))
@@ -270,15 +335,21 @@ def _check_api_auth_headers(base: str, session: ScanSession) -> list[Finding]:
     for path in test_paths:
         url = base + path
         try:
-            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
+                                allow_redirects=False)
+
+            # 7b: FailedResponse is falsy — safe_request never returns None after 7b
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", ""))
+                continue
 
             if resp.status_code not in (200, 401, 403):
                 continue
 
             www_auth = resp.headers.get("WWW-Authenticate", "")
-            auth_header = resp.headers.get("Authorization", "")
 
-            # Check for weak authentication schemes
             if "basic" in www_auth.lower():
                 findings.append(Finding(
                     agent=AgentName.API,
@@ -299,7 +370,6 @@ def _check_api_auth_headers(base: str, session: ScanSession) -> list[Finding]:
                     ),
                 ))
 
-            # Check if auth bypass is possible (endpoint returns 200 without auth)
             if resp.status_code == 200 and path not in ["/api/products"]:
                 content = resp.text[:200]
                 if len(content) > 50:
@@ -316,13 +386,15 @@ def _check_api_auth_headers(base: str, session: ScanSession) -> list[Finding]:
                         mitre_tactic="Initial Access",
                         mitre_technique="T1190 — Exploit Public-Facing Application",
                         remediation=(
-                            "Implement JWT or session-based authentication on all non-public endpoints. "
+                            "Implement JWT or session-based authentication on all non-public "
+                            "endpoints. "
                             "Return 401 Unauthorized for unauthenticated requests. "
                             "Audit all API endpoints to ensure consistent auth enforcement."
                         ),
                     ))
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings

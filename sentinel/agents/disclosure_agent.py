@@ -19,7 +19,7 @@ NEVER: exploits errors, injects payloads, modifies data
 
 import re
 import requests  # for RequestException type only
-from sentinel.core.evidence import safe_request
+from sentinel.core.evidence import safe_request, classify_failure
 
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity,
@@ -133,6 +133,25 @@ VERSION_PATTERNS = [
     (r"Rails\s+([\d.]+)",          "Rails version"),
 ]
 
+_AGENT = "disclosure_agent"
+
+
+def _record_failure(session: ScanSession, url: str,
+                    failure_class: str, failure_reason: str = "") -> None:
+    """
+    Route request failure to SessionIntelligence.record_request_failure().
+
+    After 7b: call sites pass resp.failure_class and resp.failure_reason
+    directly from FailedResponse — classified at the catch site in safe_request
+    from the real exception, not a synthetic string.
+
+    failure_class and failure_reason are also accepted as plain strings for
+    the requests.RequestException catch paths that still run outside safe_request.
+    """
+    intel = getattr(session, '_session_intel', None)
+    if intel is not None:
+        intel.record_request_failure(_AGENT, url, failure_class, failure_reason)
+
 
 def run_disclosure_agent(session: ScanSession, target_url: str) -> list[Finding]:
     """Run information disclosure analysis."""
@@ -161,12 +180,20 @@ def _check_sensitive_files(base: str, session: ScanSession) -> list[Finding]:
     for path, label, severity in SENSITIVE_FILES:
         url = base + path
         try:
-            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
+                                allow_redirects=False)
+
+            # 7b: FailedResponse is falsy (status_code == 0, ok == False)
+            # safe_request never returns None after 7b; this guard is a safety net
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", "unexpected None"))
+                continue
 
             if resp.status_code == 200 and len(resp.content) > 0:
                 content_preview = resp.text[:200].strip()
 
-                # Verify it's actually the file and not a generic 200 for everything
                 if _is_real_file_response(resp, path):
                     findings.append(Finding(
                         agent=AgentName.DISCLOSURE,
@@ -184,11 +211,13 @@ def _check_sensitive_files(base: str, session: ScanSession) -> list[Finding]:
                             f"Remove {path} from the web root immediately. "
                             "Configure web server to deny access to sensitive file types. "
                             "Add these patterns to .htaccess or nginx config: "
-                            f"deny access to {path.split('.')[-1] if '.' in path else 'this directory'} files."
+                            f"deny access to "
+                            f"{path.split('.')[-1] if '.' in path else 'this directory'} files."
                         ),
                     ))
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
@@ -204,14 +233,22 @@ def _check_error_disclosure(base: str, session: ScanSession) -> list[Finding]:
     for path in ERROR_TRIGGER_PATHS:
         url = base + path
         try:
-            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
+                                allow_redirects=False)
+
+            # 7b: FailedResponse is falsy (status_code == 0, ok == False)
+            # safe_request never returns None after 7b; this guard is a safety net
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", "unexpected None"))
+                continue
 
             if resp.status_code not in (400, 404, 500, 503):
                 continue
 
             content = resp.text
 
-            # Check for stack traces
             for pattern in STACK_TRACE_PATTERNS:
                 if re.search(pattern, content) and "stack_trace" not in checked:
                     checked.add("stack_trace")
@@ -236,7 +273,6 @@ def _check_error_disclosure(base: str, session: ScanSession) -> list[Finding]:
                     ))
                     break
 
-            # Check for version disclosure in errors
             for pattern, label in VERSION_PATTERNS:
                 match = re.search(pattern, content, re.IGNORECASE)
                 if match and label not in checked:
@@ -259,7 +295,8 @@ def _check_error_disclosure(base: str, session: ScanSession) -> list[Finding]:
                         ),
                     ))
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
@@ -276,13 +313,21 @@ def _check_directory_listing(base: str, session: ScanSession) -> list[Finding]:
     for path in dirs_to_check:
         url = base + path
         try:
-            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
+                                allow_redirects=False)
+
+            # 7b: FailedResponse is falsy (status_code == 0, ok == False)
+            # safe_request never returns None after 7b; this guard is a safety net
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", "unexpected None"))
+                continue
 
             if resp.status_code != 200:
                 continue
 
             content = resp.text.lower()
-            # Directory listing indicators
             if (("index of" in content or "directory listing" in content or
                  "<title>index of" in content) and
                     ("<a href=" in content)):
@@ -306,7 +351,8 @@ def _check_directory_listing(base: str, session: ScanSession) -> list[Finding]:
                     ),
                 ))
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
@@ -339,7 +385,16 @@ def _check_debug_endpoints(base: str, session: ScanSession) -> list[Finding]:
     for path, label in debug_paths:
         url = base + path
         try:
-            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT, allow_redirects=False)
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
+                                allow_redirects=False)
+
+            # 7b: FailedResponse is falsy (status_code == 0, ok == False)
+            # safe_request never returns None after 7b; this guard is a safety net
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", "unexpected None"))
+                continue
 
             if resp.status_code == 200 and len(resp.content) > 50:
                 findings.append(Finding(
@@ -361,7 +416,8 @@ def _check_debug_endpoints(base: str, session: ScanSession) -> list[Finding]:
                     ),
                 ))
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
@@ -373,17 +429,17 @@ def _is_real_file_response(resp: requests.Response, path: str) -> bool:
     """
     Verify the response is actually the requested file, not a generic
     200 response that the app returns for all paths (SPA behavior).
+
+    NOTE: This helper types against requests.Response directly.
+    When 7b introduces a structured response wrapper, this will need migration.
     """
     content = resp.text.lower()
 
-    # If it looks like an HTML page with navigation, it's probably a SPA fallback
     if "<html" in content and "<!doctype" in content[:200].lower():
-        # Unless it's specifically a PHP info page or similar
         if "phpinfo" in content or "php version" in content:
             return True
         return False
 
-    # Check content type matches expected file type
     content_type = resp.headers.get("Content-Type", "")
 
     if path.endswith(".json") and "json" not in content_type:
@@ -391,5 +447,4 @@ def _is_real_file_response(resp: requests.Response, path: str) -> bool:
     if path.endswith((".yml", ".yaml")) and "yaml" not in content_type and "text" not in content_type:
         return False
 
-    # If it's reasonably sized and not HTML fallback, it's real
     return len(resp.content) > 10

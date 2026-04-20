@@ -221,6 +221,16 @@ class SessionIntelligence:
         self.untested_queue:   list[str] = []  # Endpoints discovered by agents, queued for Alpha
         self.inconclusive_counts: dict[str, int] = {}  # How many times each URL returned inconclusive
 
+        # Request failure tracking — keyed by (agent_name, failure_class)
+        # failure_class: timeout | dns | tls | connection_refused | other
+        # Updated by SessionIntelligence.record_request_failure()
+        self.request_failures:  dict[tuple, int] = {}
+
+        # Last known failure reason per URL — preserves debugging detail
+        # without storing full event history.
+        # Keyed by url → {"failure_class": str, "failure_reason": str, "agent": str}
+        self.recent_failure_detail: dict[str, dict] = {}
+
         # Attack graph — drives chain-based investigation
         from sentinel.core.attack_graph import AttackGraph
         self.attack_graph: AttackGraph = AttackGraph()
@@ -861,6 +871,64 @@ class SessionIntelligence:
 
     # ── Retest policy ─────────────────────────────────────────────────────────
 
+    # ── Request failure tracking ──────────────────────────────────────────────
+
+    def record_request_failure(self, agent_name: str, url: str,
+                                failure_class: str,
+                                failure_reason: str = "") -> None:
+        """
+        Record a failed outbound request from any agent.
+
+        Called when safe_request returns a FailedResponse.
+        failure_class comes from FailedResponse.failure_class — classified at
+        the catch site in safe_request from the real exception, not a synthetic
+        string. failure_reason is the original exception message, preserved.
+
+        Matches the direct attribute mutation pattern of this class.
+
+        Args:
+            agent_name:     Name of the calling agent (e.g. 'disclosure_agent')
+            url:            The URL that failed
+            failure_class:  One of: timeout | dns | tls | connection_refused | other
+            failure_reason: Original exception message — for logs and debugging
+        """
+        import sys
+        detail = f"{failure_class}" + (f": {failure_reason[:80]}" if failure_reason else "")
+        print(f"[WARN] [{agent_name}] Request failed: {url} — {detail}",
+              file=sys.stderr)
+
+        # Aggregate counter — (agent, failure_class) → count
+        key = (agent_name, failure_class)
+        self.request_failures[key] = self.request_failures.get(key, 0) + 1
+
+        # URL-level detail — last known failure per URL, overwrites on repeat
+        # Preserves debugging detail without growing unbounded history
+        self.recent_failure_detail[url] = {
+            "agent":          agent_name,
+            "failure_class":  failure_class,
+            "failure_reason": failure_reason[:200] if failure_reason else "",
+        }
+
+    def get_request_failure_summary(self) -> dict:
+        """
+        Return request failures grouped by agent and failure class.
+        Includes total count and recent URL-level detail.
+        Used in scan summary and report output.
+        """
+        by_agent: dict[str, dict[str, int]] = {}
+        for (agent, failure_class), count in self.request_failures.items():
+            if agent not in by_agent:
+                by_agent[agent] = {}
+            by_agent[agent][failure_class] = count
+
+        total = sum(self.request_failures.values())
+
+        return {
+            "total_failures":      total,
+            "by_agent":            by_agent,
+            "recent_url_failures": self.recent_failure_detail,
+        }
+
     def _get_retest_policy(self, reason: DisproveReason) -> RetestPolicy:
         return {
             DisproveReason.AUTH_ENFORCED:  RetestPolicy.IF_AUTH_ADDED,
@@ -888,4 +956,5 @@ class SessionIntelligence:
             "queen_objectives_done": len(self.queen_objectives_completed),
             "stop_condition":        self.stop_condition.value if self.stop_condition else None,
             "confidence_context":    self.get_confidence_context(),
+            "request_failures":      self.get_request_failure_summary(),
         }

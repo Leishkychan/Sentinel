@@ -457,8 +457,7 @@ def safe_request(method: str, url: str, headers: Optional[dict] = None,
         - Never returns None — eliminates per-call-site None guards
         - Failure class classified at catch site from real exception
         - Original exception preserved on FailedResponse.failure_reason
-        - TLS verification disabled for all targets (proxy intercepts TLS on non-lab hosts)
-        - System proxy bypassed via proxies={} for direct scan-target connections
+        - TLS verification disabled only for known lab targets
         - Always sets User-Agent
         - Single place for future audit logging and rate limiting
 
@@ -492,13 +491,14 @@ def safe_request(method: str, url: str, headers: Optional[dict] = None,
             method.upper(), url,
             headers=base_headers,
             timeout=timeout,
-            verify=False,          # verify=False required — proxy intercepts TLS on non-lab targets
+            verify=verify,
             allow_redirects=kwargs.pop("allow_redirects", False),
-            proxies={"http": "", "https": ""},  # bypass system proxy for scan targets
             **kwargs,
         )
     except Exception as e:
         reason = str(e)
+        import sys as _sys
+        print(f"[DEBUG] safe_request exception [{type(e).__name__}]: {reason[:150]}", file=_sys.stderr)
         return FailedResponse(
             failure_class=classify_failure(reason),
             failure_reason=reason,

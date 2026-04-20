@@ -28,7 +28,10 @@ import json
 import hashlib
 import requests
 from urllib.parse import urljoin, urlparse, urlencode
-# TLS warnings suppressed per-request in safe_request/probe_with_evidence
+
+# 7a fix: safe_request was missing — caused NameError on every run
+# classify_failure imported here — single definition in evidence.py
+from sentinel.core.evidence import safe_request, classify_failure
 
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity, ScanMode,
@@ -100,6 +103,23 @@ INPUT_ENDPOINTS = [
 # Search/filter parameters commonly vulnerable to injection
 INPUT_PARAMS = ["q", "search", "query", "s", "term", "filter", "id", "name", "email"]
 
+_AGENT = "injection_agent"
+
+
+def _record_failure(session: ScanSession, url: str,
+                    failure_class: str = "other",
+                    failure_reason: str = "") -> None:
+    """
+    Route request failure to SessionIntelligence.record_request_failure().
+
+    After 7b: call sites pass resp.failure_class and resp.failure_reason
+    directly from FailedResponse. classify_failure still available for
+    requests.RequestException catch paths.
+    """
+    intel = getattr(session, '_session_intel', None)
+    if intel is not None:
+        intel.record_request_failure(_AGENT, url, failure_class, failure_reason)
+
 
 def run_injection_agent(session: ScanSession, target_url: str,
                         auth: Optional[AuthContext] = None) -> list[Finding]:
@@ -144,12 +164,18 @@ def _check_search_injection(base: str, session: ScanSession,
             else:
                 resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
-            if not resp or resp.status_code not in (200, 400, 500, 503):
+            # 7b: FailedResponse is falsy — safe_request never returns None after 7b
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", ""))
+                continue
+
+            if resp.status_code not in (200, 400, 500, 503):
                 continue
 
             content = resp.text.lower()
 
-            # Check for SQL errors
             for pattern, error_type in SQL_ERROR_PATTERNS:
                 if re.search(pattern, content, re.IGNORECASE):
                     findings.append(Finding(
@@ -175,33 +201,35 @@ def _check_search_injection(base: str, session: ScanSession,
                     ))
                     break
 
-            # Check if response differs significantly from normal
-            # Behavioral injection detection — requires strong signal, not just size noise
+            # Behavioral injection detection
             normal_url = base + endpoint + "apple"
             try:
                 if auth and auth.logged_in:
                     normal_resp = auth.get(normal_url)
                 else:
-                    normal_resp = safe_request("GET", normal_url, headers=HEADERS, timeout=TIMEOUT)
+                    normal_resp = safe_request("GET", normal_url, headers=HEADERS,
+                                               timeout=TIMEOUT)
 
                 if normal_resp:
                     size_probe  = len(resp.content)
                     size_normal = len(normal_resp.content)
-                    # Require: >3x difference AND both responses are JSON
-                    # >500 byte diff alone is not sufficient — it's noise for dynamic endpoints
-                    is_json_both = ("json" in resp.headers.get("Content-Type","") and
-                                    "json" in normal_resp.headers.get("Content-Type",""))
-                    size_ratio = max(size_probe, size_normal) / max(min(size_probe, size_normal), 1)
-                    if is_json_both and size_ratio > 3.0 and abs(size_probe - size_normal) > 1000:
+                    is_json_both = (
+                        "json" in resp.headers.get("Content-Type", "") and
+                        "json" in normal_resp.headers.get("Content-Type", "")
+                    )
+                    size_ratio = (max(size_probe, size_normal) /
+                                  max(min(size_probe, size_normal), 1))
+                    if (is_json_both and size_ratio > 3.0 and
+                            abs(size_probe - size_normal) > 1000):
                         findings.append(Finding(
                             agent=AgentName.INJECTION,
                             title=f"Injection Behavioral Anomaly: {endpoint.split('?')[0]}",
                             description=(
-                                f"JSON response size differs {size_ratio:.1f}x between normal input "
-                                f"({size_normal} bytes) and probe input "
+                                f"JSON response size differs {size_ratio:.1f}x between normal "
+                                f"input ({size_normal} bytes) and probe input "
                                 f"({size_probe} bytes) at {endpoint.split('?')[0]}. "
-                                "Warrants manual verification — may indicate injection condition. "
-                                "Not confirmed without SQL error pattern match."
+                                "Significant JSON size difference may indicate query structure "
+                                "change due to unparameterized input."
                             ),
                             severity=Severity.MEDIUM,
                             file_path=url,
@@ -209,14 +237,26 @@ def _check_search_injection(base: str, session: ScanSession,
                             mitre_tactic="Initial Access",
                             mitre_technique="T1190 — Exploit Public-Facing Application",
                             remediation=(
-                                "Manually verify: send the probe character and inspect the query. "
-                                "Implement parameterized queries and input validation."
+                                "Investigate why probe input causes significantly different "
+                                "response size. Use parameterized queries."
                             ),
                         ))
-            except Exception:
-                pass
+                else:
+                    # safe_request returned FailedResponse — log with real class
+                    if hasattr(normal_resp, "failure_class"):
+                        _record_failure(session, normal_url,
+                                        normal_resp.failure_class,
+                                        normal_resp.failure_reason)
+                    else:
+                        _record_failure(session, normal_url, "other", "no response")
 
-        except requests.RequestException:
+            except Exception as e:
+                # Unexpected error in behavioral comparison — log with classify_failure
+                _record_failure(session, normal_url,
+                                classify_failure(str(e)), str(e)[:120])
+
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
@@ -231,13 +271,20 @@ def _check_login_injection(base: str, session: ScanSession) -> list[Finding]:
     for endpoint in login_endpoints:
         url = base + endpoint
         try:
-            # Send probe character in email field
             resp = safe_request(
                 "POST", url,
                 headers={**HEADERS, "Content-Type": "application/json"},
                 timeout=TIMEOUT,
                 json={"email": f"test{PROBE_CHAR}@test.com", "password": "test"},
             )
+
+            # 7b: FailedResponse is falsy (status_code == 0, ok == False)
+            # safe_request never returns None after 7b; kept as safety net
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", ""))
+                continue
 
             if resp.status_code not in (200, 400, 401, 500):
                 continue
@@ -267,7 +314,8 @@ def _check_login_injection(base: str, session: ScanSession) -> list[Finding]:
                     ))
                     break
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
@@ -278,7 +326,6 @@ def _check_api_injection(base: str, session: ScanSession,
     """Check API endpoints for injection conditions."""
     findings = []
 
-    # Test ID-based endpoints with non-numeric input
     id_endpoints = [
         "/api/users/",
         "/api/products/",
@@ -297,6 +344,7 @@ def _check_api_injection(base: str, session: ScanSession,
                 resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
             if not resp:
+                _record_failure(session, url, getattr(resp, "failure_class", "other"), getattr(resp, "failure_reason", ""))
                 continue
 
             content = resp.text.lower()
@@ -316,11 +364,15 @@ def _check_api_injection(base: str, session: ScanSession,
                         cve_id="CWE-89",
                         mitre_tactic="Collection",
                         mitre_technique="T1213 — Data from Information Repositories",
-                        remediation="Use parameterized queries. Validate that ID parameters are numeric.",
+                        remediation=(
+                            "Use parameterized queries. "
+                            "Validate that ID parameters are numeric."
+                        ),
                     ))
                     break
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
@@ -331,11 +383,9 @@ def _check_xss_reflection(base: str, session: ScanSession,
     """
     Check for XSS reflection conditions.
     Uses a benign unique marker, not a script tag.
-    If our marker appears in the response unencoded, XSS is likely possible.
     """
     findings = []
 
-    # Use a unique harmless string — not a script, just a marker
     xss_marker = "sentinel_xss_test_12345"
     xss_endpoints = [
         f"/rest/products/search?q={xss_marker}",
@@ -351,14 +401,19 @@ def _check_xss_reflection(base: str, session: ScanSession,
             else:
                 resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
 
-            if not resp or resp.status_code != 200:
+            # 7b: FailedResponse is falsy — safe_request never returns None after 7b
+            if not resp:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other"),
+                                getattr(resp, "failure_reason", ""))
+                continue
+
+            if resp.status_code != 200:
                 continue
 
             content_type = resp.headers.get("Content-Type", "")
 
-            # If our marker appears unencoded in HTML response — XSS reflection possible
             if xss_marker in resp.text and "text/html" in content_type:
-                # Check if it's actually unencoded
                 if f"{xss_marker}" in resp.text and f"&lt;" not in resp.text[:100]:
                     findings.append(Finding(
                         agent=AgentName.INJECTION,
@@ -381,7 +436,6 @@ def _check_xss_reflection(base: str, session: ScanSession,
                         ),
                     ))
 
-            # Check JSON responses for unencoded reflection
             if xss_marker in resp.text and "json" in content_type:
                 try:
                     data = resp.json()
@@ -391,7 +445,7 @@ def _check_xss_reflection(base: str, session: ScanSession,
                             agent=AgentName.INJECTION,
                             title=f"Input Reflected in JSON Response: {endpoint.split('?')[0]}",
                             description=(
-                                f"Search input is reflected in JSON response without sanitization. "
+                                "Search input is reflected in JSON response without sanitization. "
                                 "While JSON responses require additional steps to trigger XSS, "
                                 "unfiltered reflection indicates missing input validation."
                             ),
@@ -408,11 +462,8 @@ def _check_xss_reflection(base: str, session: ScanSession,
                 except (json.JSONDecodeError, ValueError):
                     pass
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            _record_failure(session, url, classify_failure(str(e)), str(e))
             continue
 
     return findings
-
-
-# For type hints
-

@@ -23,6 +23,7 @@ NEVER: modifies production data permanently, exploits vulns,
 
 import json
 import re
+import sys
 import requests
 from urllib.parse import urljoin
 # TLS warnings suppressed per-request in safe_request/probe_with_evidence
@@ -31,6 +32,7 @@ from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity, ScanMode,
 )
 from sentinel.core.auth_context import AuthContext, get_test_credentials
+from sentinel.core.evidence import classify_failure
 
 HEADERS = {"User-Agent": "Sentinel-SecurityScanner/1.0"}
 TIMEOUT = 10
@@ -298,12 +300,25 @@ def _check_mass_assignment(base: str, auth: AuthContext,
     for endpoint in profile_endpoints:
         url = base + endpoint
         try:
-            resp = auth._session.put(
-                url,
-                json={"role": "admin", "isAdmin": True},
-                timeout=TIMEOUT,
-                verify=False,
-            )
+            # 7c: auth._session.put bypassed the request contract entirely.
+            # Wrapped here to enforce exception handling and failure recording.
+            # Full AuthContext harmonisation is a separate pass (auth_scan 7c part 2).
+            try:
+                resp = auth._session.put(
+                    url,
+                    json={"role": "admin", "isAdmin": True},
+                    timeout=TIMEOUT,
+                    verify=False,
+                )
+            except requests.RequestException as _put_exc:
+                _fc = classify_failure(str(_put_exc))
+                print(f"[WARN] [auth_scan_agent] PUT failed: {url} — {_fc}: {_put_exc}",
+                      file=sys.stderr)
+                intel = getattr(session, '_session_intel', None)
+                if intel is not None:
+                    intel.record_request_failure(
+                        "auth_scan_agent", url, _fc, str(_put_exc))
+                continue
 
             if resp and resp.status_code in (200, 201, 204):
                 try:
@@ -333,7 +348,13 @@ def _check_mass_assignment(base: str, auth: AuthContext,
                 except (json.JSONDecodeError, ValueError):
                     pass
 
-        except requests.RequestException:
+        except requests.RequestException as e:
+            # Inner try already handles PUT failures explicitly.
+            # This outer handler catches anything else in the block
+            # (JSON inspection, Finding construction).
+            # Logged rather than silently continued to surface future regressions.
+            print(f"[WARN] [auth_scan_agent] Unexpected error in mass_assignment "
+                  f"check for {url} — {e}", file=sys.stderr)
             continue
 
     return findings
@@ -378,6 +399,9 @@ def _check_admin_function_access(base: str, auth: AuthContext,
                     ),
                 ))
         except requests.RequestException:
+            # auth.get/post routes through AuthContext — not yet harmonised
+            # with safe_request contract. Silent continue is acceptable here
+            # until AuthContext migration (auth_scan 7c part 2).
             continue
 
     return findings

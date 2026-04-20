@@ -18,8 +18,9 @@ NEVER: executes JavaScript, modifies anything, sends payloads
 
 import re
 import json
+import sys
 import requests  # for RequestException type only
-from sentinel.core.evidence import safe_request
+from sentinel.core.evidence import safe_request, classify_failure
 from urllib.parse import urljoin, urlparse
 # TLS warnings suppressed per-request in safe_request/probe_with_evidence
 
@@ -62,6 +63,20 @@ INTERNAL_PATTERNS = [
     (r'(?i)127\.0\.0\.1:\d{4,5}', "Loopback Reference"),
 ]
 
+_AGENT = "js_analysis_agent"
+
+
+def _record_failure(session: ScanSession, url: str,
+                    failure_class: str = "other",
+                    failure_reason: str = "") -> None:
+    """
+    Route request failure to SessionIntelligence.record_request_failure().
+    classify_failure() imported from evidence.py — single definition.
+    """
+    intel = getattr(session, '_session_intel', None)
+    if intel is not None:
+        intel.record_request_failure(_AGENT, url, failure_class, failure_reason)
+
 
 def run_js_agent(session: ScanSession, target_url: str) -> list[Finding]:
     """Download and analyze all JavaScript files from the target."""
@@ -71,32 +86,36 @@ def run_js_agent(session: ScanSession, target_url: str) -> list[Finding]:
     findings = []
 
     # Find JS files from the main page
-    js_urls = _discover_js_files(base)
+    js_urls = _discover_js_files(base, session)
     print(f"[JS] Found {len(js_urls)} JavaScript files to analyze")
 
-    # Check for source map exposure
+    # Check for source map exposure (session passed for failure recording)
     for js_url in js_urls[:20]:  # Cap at 20 files
         findings.extend(_check_source_map(js_url, session))
 
     # Analyze JS content
     for js_url in js_urls[:10]:  # Deeper analysis on first 10
-        content = _fetch_js(js_url)
+        content = _fetch_js(js_url, session)
         if not content:
             continue
 
         findings.extend(_find_secrets(content, js_url))
-        findings.extend(_find_endpoints(content, js_url, base))
+        findings.extend(_find_endpoints(content, js_url, base, session))
         findings.extend(_find_internal_references(content, js_url))
 
     print(f"[JS] {len(findings)} JavaScript findings")
     return findings
 
 
-def _discover_js_files(base: str) -> list[str]:
+def _discover_js_files(base: str, session: ScanSession) -> list[str]:
     """Fetch the main page and extract all JS file URLs."""
     js_urls = []
     try:
         resp = safe_request("GET", base, headers=HEADERS, timeout=TIMEOUT)
+        if not resp.ok and resp.status_code == 0:
+            # FailedResponse — record failure and return empty list
+            _record_failure(session, base, resp.failure_class, resp.failure_reason)
+            return js_urls
         if resp.status_code != 200:
             return js_urls
 
@@ -118,23 +137,30 @@ def _discover_js_files(base: str) -> list[str]:
         ]
         for path in common_js:
             url = base + path
-            try:
-                r = safe_request("HEAD", url, headers=HEADERS, timeout=5)
-                if r.status_code == 200:
-                    js_urls.append(url)
-            except requests.RequestException:
-                pass
+            r = safe_request("HEAD", url, headers=HEADERS, timeout=5)
+            if not r.ok and r.status_code == 0:
+                # FailedResponse — record but continue; HEAD failure expected
+                # for non-existent paths on hardened targets
+                _record_failure(session, url, r.failure_class, r.failure_reason)
+            elif r.status_code == 200:
+                js_urls.append(url)
 
-    except requests.RequestException:
-        pass
+    except Exception as e:
+        # Outer safety net — safe_request should not raise after 7b,
+        # but kept to prevent agent crash on unexpected errors
+        _record_failure(session, base, classify_failure(str(e)), str(e))
 
     return list(dict.fromkeys(js_urls))  # Deduplicate
 
 
-def _fetch_js(url: str) -> str | None:
+def _fetch_js(url: str, session: ScanSession) -> str | None:
     """Fetch JS file content, skip if too large."""
     try:
         resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT)
+        if not resp.ok and resp.status_code == 0:
+            # FailedResponse — record and return None
+            _record_failure(session, url, resp.failure_class, resp.failure_reason)
+            return None
         if resp.status_code != 200:
             return None
         size_kb = len(resp.content) / 1024
@@ -148,6 +174,7 @@ def _fetch_js(url: str) -> str | None:
             text = text[:200000] + "\n/* ...SENTINEL SAMPLE... */\n" + text[-50000:]
         return text
     except requests.RequestException:
+        # RequestException no longer reachable after 7b — kept as safety net
         return None
 
 
@@ -157,6 +184,10 @@ def _check_source_map(js_url: str, session: ScanSession) -> list[Finding]:
     map_url = js_url + ".map"
     try:
         resp = safe_request("GET", map_url, headers=HEADERS, timeout=TIMEOUT)
+        if not resp.ok and resp.status_code == 0:
+            # FailedResponse — map file not reachable, record and return
+            _record_failure(session, map_url, resp.failure_class, resp.failure_reason)
+            return findings
         if resp.status_code == 200 and len(resp.content) > 100:
             try:
                 data = resp.json()
@@ -185,6 +216,7 @@ def _check_source_map(js_url: str, session: ScanSession) -> list[Finding]:
             except (json.JSONDecodeError, ValueError):
                 pass
     except requests.RequestException:
+        # RequestException no longer reachable after 7b — kept as safety net
         pass
     return findings
 
@@ -225,7 +257,8 @@ def _find_secrets(content: str, js_url: str) -> list[Finding]:
     return findings
 
 
-def _find_endpoints(content: str, js_url: str, base: str) -> list[Finding]:
+def _find_endpoints(content: str, js_url: str, base: str,
+                    session: ScanSession) -> list[Finding]:
     """Extract and report internal API endpoints found in JavaScript."""
     all_endpoints = set()
     for pattern in ENDPOINT_PATTERNS:
@@ -240,12 +273,13 @@ def _find_endpoints(content: str, js_url: str, base: str) -> list[Finding]:
         accessible = []
         for ep in list(all_endpoints)[:20]:
             url = base + ep if ep.startswith("/") else ep
-            try:
-                resp = safe_request("GET", url, headers=HEADERS, timeout=5)
-                if resp.status_code == 200:
-                    accessible.append(ep)
-            except requests.RequestException:
-                continue
+            resp = safe_request("GET", url, headers=HEADERS, timeout=5)
+            if not resp.ok and resp.status_code == 0:
+                # FailedResponse — record; endpoint unreachable
+                _record_failure(session, url, resp.failure_class,
+                                resp.failure_reason)
+            elif resp.status_code == 200:
+                accessible.append(ep)
 
         if accessible:
             # Build full URL list — stored in metadata for orchestrator to pass to session_intel
