@@ -176,24 +176,8 @@ def _check_admin_endpoints(base: str, session: ScanSession) -> list[Finding]:
             content_len = er.size_bytes
 
             if _is_spa_fallback(resp, er, baseline):
-                findings.append(Finding(
-                    agent=AgentName.PROBE,
-                    title=f"SPA Route Responds: {path}",
-                    description=(
-                        f"Endpoint {url} returned HTTP 200 with {content_len} bytes (HTML). "
-                        "Response matches SPA shell pattern — likely client-side routing, "
-                        "not server-side admin functionality. "
-                        f"{artifact.format_report()}"
-                    ),
-                    severity=Severity.LOW,
-                    file_path=url,
-                    mitre_tactic="Discovery",
-                    mitre_technique="T1083 — File and Directory Discovery",
-                    remediation=(
-                        "Verify whether this path exposes real admin functionality server-side. "
-                        "SPA routing may hide actual access control issues."
-                    ),
-                ))
+                print(f"[PROBE] SPA skip: {path} — matches baseline (HTML, size ±5%, hash match)")
+                continue
             elif content_len > 100 and er.response_type == "JSON":
                 from sentinel.core.models import EvidenceRef as _ERef
                 _ev = _ERef(
