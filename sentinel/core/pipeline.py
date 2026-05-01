@@ -559,13 +559,8 @@ class FindingPipeline:
         return None
 
     def _find_sensitive_fields(self, content: str) -> list[str]:
-        text  = content.lower()
-        found = []
-        for field in ["password", "passwordhash", "token", "apikey", "secret",
-                       "email", "creditcard", "ssn", "totpsecret"]:
-            if field in text:
-                found.append(field)
-        return found[:5]
+        from sentinel.core.evidence import find_sensitive_fields_in_json
+        return find_sensitive_fields_in_json(content)[:5]
 
     def _build_proof(self, content: str, rtype: str, status: int,
                      sensitive: list[str]) -> Optional[str]:

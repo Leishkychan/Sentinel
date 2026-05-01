@@ -10,6 +10,7 @@ This is not optional middleware. This is the contract.
 
 import os
 from typing import Optional
+from urllib.parse import urlparse
 from .models import ScanMode, AgentName, ScanSession, AuditEntry
 from .audit import log_audit_entry
 
@@ -183,18 +184,30 @@ def validate_action(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _canonicalize_target(target: str) -> str:
+    """
+    Reduce a target to a canonical netloc for scope comparison.
+    Full URL  → netloc  (e.g. "http://localhost:3000/api" → "localhost:3000")
+    Bare host → as-is   (e.g. "localhost" → "localhost")
+    Always lowercased and stripped.
+    """
+    target = target.strip().lower()
+    parsed = urlparse(target)
+    # urlparse only populates netloc when a scheme is present
+    return parsed.netloc if parsed.netloc else target
+
+
 def _target_in_scope(target: str, approved: list[str]) -> bool:
     """
     Check if target matches any approved entry.
-    Supports exact match and subdomain matching.
+    Both sides are canonicalized to netloc before comparison so agents
+    that pass a full URL and agents that pass a bare hostname both work.
+    Strict exact match only — no subdomain wildcards.
     """
-    target = target.strip().lower()
+    canonical_target = _canonicalize_target(target)
     for approved_target in approved:
-        approved_target = approved_target.strip().lower()
-        if target == approved_target:
+        if canonical_target == _canonicalize_target(approved_target):
             return True
-        # Allow subdomain match: dvwa.local matches *.local? No — exact only.
-        # Subdomain matching is a footgun. Keep it strict.
     return False
 
 
@@ -211,6 +224,25 @@ def _block_and_log(
         action=action,
         target=target,
         mode=session.mode,
+        allowed=False,
+        reason=reason,
+    )
+    log_audit_entry(entry)
+
+
+def _block_and_log_chokepoint(action: str, target: str, reason: str) -> None:
+    """
+    Log a hard stop at HTTP chokepoint (safe_request/probe_with_evidence).
+    Called when exploit-shaped payload detected before session context available.
+    
+    Uses minimal entry without agent/session context.
+    """
+    entry = AuditEntry(
+        session_id="chokepoint_detection",
+        agent=AgentName.ORCHESTRATOR,  # sentinel agent name
+        action=action,
+        target=target,
+        mode=ScanMode.PROBE,  # sentinel mode
         allowed=False,
         reason=reason,
     )
@@ -234,3 +266,91 @@ def _allow_and_log(
         reason=reason or "Passed all validation checks",
     )
     log_audit_entry(entry)
+
+
+# ── Payload-shape inspector (CRITICAL #2 wire-up) ────────────────────────────
+
+def detect_exploit_action(method: str, url: str, body: Optional[str]) -> Optional[str]:
+    """
+    Detect exploit-shaped payloads in URL and request body.
+    Maps to HARDCODED_BLOCKS action names if pattern matches.
+
+    Returns action name if exploit detected, None if safe probe.
+
+    Patterns detect:
+    - SQL injection: quote + logic operators, UNION SELECT, comment/semicolon markers
+    - Command injection: $(), backticks, shell metacharacters with pipes/semicolons
+    - XSS payloads: <script, event handlers, javascript: protocol
+    - File operations: multipart upload, path traversal in upload filename
+
+    Intentionally NOT flagged (legitimate discovery):
+    - SQL keywords (SELECT, INSERT, DELETE) without injection operators — normal URL segments
+    - POST with password/email fields — normal auth form probing
+    - URLs containing .sh, .exe, .bat — legitimate exposure checks
+    """
+    import re
+
+    payload = (url + " " + (body or "")).lower()
+
+    # SQL injection patterns — all require quote or semicolon injection context
+    sql_patterns = [
+        r"'\s*(and|or)\s*\d+\s*=",          # ' AND 1=1 / ' OR 1=1
+        r"'\s*(and|or|union)\s+",            # ' AND / ' OR / ' UNION
+        r"union\s+select",                   # UNION SELECT
+        r";\s*(drop|delete|update|insert)",  # ; DROP/DELETE/UPDATE/INSERT
+        r"--\s*$",                           # SQL comment end-of-line
+        r"/\*.*\*/",                         # SQL comment block
+    ]
+
+    for pattern in sql_patterns:
+        if re.search(pattern, payload):
+            return "sql_injection_active"
+
+    # Command injection patterns
+    cmd_patterns = [
+        r"\$\(",                                                          # $(...) command substitution
+        r"`[^`]*`",                                                       # backtick command substitution
+        r";\s*(cat|ls|whoami|id|pwd|curl|wget|nc|bash|sh|powershell)",   # ; cmd
+        r"\|\s*(cat|ls|nc|curl|wget|xargs|bash|sh)",                     # | cmd (pipe)
+        r"&&\s*(cat|nc|bash|powershell)",                                 # && cmd
+        r"\|\s*nc\s+",                                                    # pipe to netcat
+        r">\s*/dev/tcp/",                                                 # bash TCP redirection
+        r">\s*/dev/udp/",                                                 # bash UDP redirection
+    ]
+
+    for pattern in cmd_patterns:
+        if re.search(pattern, payload):
+            return "command_injection"
+
+    # XSS payload patterns
+    xss_patterns = [
+        r"<\s*script[^>]*>",                # <script> tag
+        r"javascript\s*:",                  # javascript: protocol
+        r"on\w+\s*=",                       # onerror=, onclick=, onload=, etc.
+        r"<\s*img[^>]*on",                  # <img onerror
+        r"<\s*svg[^>]*on",                  # <svg onerror
+        r"eval\s*\(",                       # eval(
+        r"expression\s*\(",                 # expression(
+    ]
+
+    for pattern in xss_patterns:
+        if re.search(pattern, payload):
+            return "xss_active"
+
+    # File upload patterns — require multipart or path traversal context
+    file_patterns = [
+        r"(upload|file)\s*=\s*@",           # multipart file upload
+        r"filename\s*=\s*\.\./",            # path traversal in upload filename
+    ]
+
+    for pattern in file_patterns:
+        if re.search(pattern, payload):
+            return "upload_file"
+
+    # Path traversal with write/delete operation context
+    if any(kw in payload for kw in ["../", "..\\", "%2e%2e", "%252e"]):
+        if any(op in payload for op in ["write", "delete", "mkdir", "rmdir", "rm ", "del "]):
+            return "write_file"
+
+    # No exploit pattern detected
+    return None

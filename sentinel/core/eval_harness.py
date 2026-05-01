@@ -10,7 +10,7 @@ Design rules (enforced):
   1. TP/FP/FN matching is deterministic — endpoint path + agent type, not substrings
   2. FP = findings that match no known vuln, period
   3. FN = known vulns not found at all (tracked separately from detected-unconfirmed)
-  4. Evidence = proof_snippet present and non-empty
+  4. Evidence = structured EvidenceRef object present and sufficient for confirmation
   5. Chains = validated from session_intel confirmed_urls — not capped, validated
   6. Hallucinations = tied to scoring engine delta threshold
   7. Hypotheses tracked separately from budget
@@ -67,7 +67,7 @@ class EvalRun:
 
     # Evidence quality
     total_findings:          int = 0
-    findings_with_evidence:  int = 0  # proof_snippet present and non-empty
+    findings_with_evidence:  int = 0  # structured EvidenceRef present and sufficient
     findings_with_standards: int = 0  # OWASP category OR MITRE mapping
     hallucinations_blocked:  int = 0  # Scoring deltas > threshold
     time_to_first_confirmed: Optional[float] = None
@@ -332,11 +332,10 @@ class EvalHarness:
         hyp_gen    = self.hypotheses_generated or (intel.budget_used if intel else 0)
         hyp_tested = self.hypotheses_tested    or (intel.budget_used if intel else 0)
 
-        # ── Evidence: proof_snippet present ───────────────────────────────────
+        # ── Evidence: structured evidence object present and sufficient ─────────
         with_evidence = sum(
             1 for f in findings
-            if getattr(f, 'proof_snippet', None) or
-               "📊 Blast radius" in (f.description or "") and ("MEASURED" in (f.description or "") or "measured" in (f.description or ""))
+            if f.evidence is not None and f.evidence.is_sufficient_for_confirmation()[0]
         )
 
         # ── Standards: OWASP OR MITRE ─────────────────────────────────────────
@@ -345,12 +344,13 @@ class EvalHarness:
             if (f.mitre_tactic and
                 f.mitre_tactic not in ("Multiple", "Unknown", "", None)) or
                any(marker in (f.description or "")
-                   for marker in ("ASVS", "WSTG", "📋", "OWASP"))
+                   for marker in ("ASVS", "WSTG", "OWASP"))
         )
 
         # ── TP/FP/FN — deterministic ─────────────────────────────────────────
+        disproven_urls: set = intel.disproven_urls if intel else set()
         tp_ids, fp_count, fn_ids, unconfirmed_ids = self._score_deterministic(
-            findings, confirmed_urls
+            findings, confirmed_urls, disproven_urls
         )
 
         # ── Chain validation — real, not capped ──────────────────────────────
@@ -385,6 +385,7 @@ class EvalHarness:
         self,
         findings,
         confirmed_urls: set,
+        disproven_urls: set = None,
     ) -> tuple[set, int, set, set]:
         """
         Deterministic TP/FP/FN.
@@ -397,9 +398,16 @@ class EvalHarness:
         A finding is FP if it matches NO known vuln (regardless of confirmation).
         A known vuln is FN if it was never found (not even unconfirmed).
         A known vuln is detected_unconfirmed if found but not confirmed.
+
+        Classification based solely on pipeline state:
+          is_confirmed: f.file_path in confirmed_urls
+          is_refuted:   f.file_path in disproven_urls
+        No substring matching on description text or formatting markers.
         """
         if not self.known_vulns:
             return set(), 0, set(), set()
+
+        _disproven = disproven_urls or set()
 
         matched_confirmed:   set[str] = set()
         matched_unconfirmed: set[str] = set()
@@ -430,55 +438,28 @@ class EvalHarness:
                 if ep_match:
                     finding_matched_ids.add(finding_id)
 
-                    # is_confirmed: pipeline confirmed AND URL in confirmed_urls
-                    desc_or = f.description or ""
-                    is_confirmed = (
-                        (f.file_path in confirmed_urls) or
-                        ("📊 Blast radius" in desc_or and ("MEASURED" in desc_or or "measured" in desc_or)) or
-                        ("[Root Cause]" in (f.title or "") and known_path in desc_or.lower())
-                    )
+                    # is_confirmed: pipeline state only — URL in confirmed_urls
+                    is_confirmed = f.file_path in confirmed_urls
 
-                    # is_refuted: 401/403, disproven, or SPA fallback
-                    # These must NOT count as detected_unconfirmed
-                    desc_lower = (f.description or "").lower()
-                    is_refuted = (
-                        "401" in desc_lower or
-                        "403" in desc_lower or
-                        "auth: required" in desc_lower or
-                        "authentication enforced" in desc_lower or
-                        "spa shell" in desc_lower or
-                        "spa fallback" in desc_lower or
-                        "not vulnerable" in (f.title or "").lower()
-                    )
+                    # is_refuted: pipeline state only — URL in disproven_urls
+                    is_refuted = f.file_path in _disproven
 
                     if is_confirmed:
                         matched_confirmed.add(known.vuln_id)
                     elif not is_refuted:
-                        # Only counts as detected_unconfirmed if:
-                        # - endpoint matched a known vuln path
-                        # - was not refuted
-                        # - has some evidence (not a raw hypothesis)
-                        has_evidence = (
-                            getattr(f, 'proof_snippet', None) or
-                            "HTTP 200" in (f.description or "") or
-                            "returned" in (f.description or "").lower()
-                        )
-                        if has_evidence:
+                        # Detected but not confirmed and not refuted.
+                        # Require structured evidence to distinguish a probed finding
+                        # from a raw LLM hypothesis with no HTTP proof.
+                        if f.evidence is not None:
                             matched_unconfirmed.add(known.vuln_id)
 
-        # FP: non-INFO findings that matched NO known vuln
-        # Exclude structural findings that are outside the known-vuln scope:
-        #   - SPA route detections (client-side routing, not security vulns)
-        #   - ATT&CK enriched compound findings (derived, not direct probes)
-        #   - Root cause groupings (aggregates, not individual findings)
-        #   - Recon findings with no specific endpoint (DNS, HTTPS at infra level)
-        EXCLUDED_TITLES = ('spa route', 'root cause', 'attck', 'dns resolution',
-                           'multiple dns', 'compound risk', 'missing authentication enforcement')
+        # FP: non-INFO findings that matched NO known vuln.
+        # No exclusions — EXCLUDED_TITLES hidden Queen FP findings from scoring.
+        # If Queen produces wrong findings, fix Queen (#5, #7), not the scorer.
         fp_count = sum(
             1 for f in findings
             if id(f) not in finding_matched_ids and
-               str(f.severity).split(".")[-1].upper() not in ("INFO",) and
-               not any(ex in (f.title or "").lower() for ex in EXCLUDED_TITLES)
+               str(f.severity).split(".")[-1].upper() not in ("INFO",)
         )
 
         # FN: testable known vulns never found at all

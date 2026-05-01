@@ -15,9 +15,15 @@ Evidence artifacts are:
 
 import json
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Optional
 import requests as _requests
+from .validator import detect_exploit_action, HardStop, _block_and_log_chokepoint
+
+# Per-execution policy gate context — set once by run_orchestrator, read by HTTP chokepoints.
+# ContextVar is safe for concurrent scans: each call context carries its own value.
+_policy_gate_ctx: ContextVar = ContextVar('sentinel_policy_gate', default=None)
 
 
 @dataclass
@@ -125,11 +131,42 @@ SENSITIVE_FIELDS = [
 ]
 
 
+def find_sensitive_fields_in_json(content: str) -> list[str]:
+    """
+    Detect sensitive field names by inspecting actual JSON keys only.
+    Does not substring-match on raw text — avoids false positives from
+    URLs and string values that contain sensitive words
+    (e.g. help_url: "/reset-password" must not flag "password").
+    Returns fields from SENSITIVE_FIELDS that exist as keys in the JSON structure.
+    """
+    try:
+        data = json.loads(content)
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+    all_keys: set = set()
+
+    def _collect_keys(obj, depth=0):
+        if depth > 4:
+            return
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                all_keys.add(k.lower())
+                _collect_keys(v, depth + 1)
+        elif isinstance(obj, list):
+            for item in obj[:3]:
+                _collect_keys(item, depth + 1)
+
+    _collect_keys(data)
+    return [f for f in SENSITIVE_FIELDS if f.lower() in all_keys]
+
+
 def probe_with_evidence(url: str, method: str = "GET",
                         headers: Optional[dict] = None,
                         body: Optional[dict] = None,
                         auth_sent: bool = False,
-                        timeout: int = 10) -> tuple[Optional[_requests.Response], EvidenceArtifact]:
+                        timeout: int = 10,
+                        policy_gate=None) -> tuple[Optional[_requests.Response], EvidenceArtifact]:
     """
     Execute a probe and capture full evidence artifact.
     Returns (response, artifact) — artifact always populated even on failure.
@@ -147,6 +184,28 @@ def probe_with_evidence(url: str, method: str = "GET",
         headers={k: v for k, v in base_headers.items() if "authorization" not in k.lower()},
         body=json.dumps(body) if body else None,
     )
+
+    # CRITICAL #2: Detect exploit-shaped payloads and block
+    body_str = json.dumps(body) if body else None
+    exploit_action = detect_exploit_action(method, url, body_str)
+    if exploit_action:
+        _block_and_log_chokepoint(
+            action=exploit_action,
+            target=url,
+            reason=f"Exploit-shaped payload detected: {exploit_action}"
+        )
+        raise HardStop(
+            f"Payload blocked by shape detector: '{exploit_action}' detected in request. "
+            f"Sentinel is a find-only tool."
+        )
+
+    # CRITICAL #3: Check policy rate limit before dispatch
+    _gate = policy_gate if policy_gate is not None else _policy_gate_ctx.get()
+    if _gate is not None:
+        from .policy import policy_check_probe
+        if not policy_check_probe(url, method, _gate):
+            artifact = _failed_artifact(req_artifact, "Rate limit exceeded")
+            return None, artifact
 
     try:
         if method == "GET":
@@ -181,12 +240,16 @@ def _build_artifact(req: RequestArtifact, resp: _requests.Response,
     size    = len(resp.content)
     content = resp.text
 
-    # Determine response type
-    if "json" in ctype or (content.strip().startswith(("{", "["))):
+    # Determine response type — header first, body only when small
+    if "json" in ctype:
         rtype = "JSON"
     elif "html" in ctype:
         rtype = "HTML"
-    elif content.strip():
+    elif size == 0:
+        rtype = "EMPTY"
+    elif size < 4096 and content[:1] in ("{", "["):
+        rtype = "JSON"
+    elif size > 0:
         rtype = "TEXT"
     else:
         rtype = "EMPTY"
@@ -210,31 +273,8 @@ def _build_artifact(req: RequestArtifact, resp: _requests.Response,
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Detect sensitive fields — parse actual JSON keys, not substring match
-    # Substring match produces false positives (e.g. "password" in URL strings)
-    sensitive = []
-    if rtype == "JSON":
-        try:
-            data = json.loads(content)
-            # Flatten all keys from the JSON structure
-            all_keys = set()
-            def _collect_keys(obj, depth=0):
-                if depth > 4:
-                    return
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        all_keys.add(k.lower())
-                        _collect_keys(v, depth + 1)
-                elif isinstance(obj, list):
-                    for item in obj[:3]:  # Sample first 3 items
-                        _collect_keys(item, depth + 1)
-            _collect_keys(data)
-            # Only flag fields that actually exist as JSON keys
-            for field_name in SENSITIVE_FIELDS:
-                if field_name.lower() in all_keys:
-                    sensitive.append(field_name)
-        except (json.JSONDecodeError, ValueError):
-            pass  # Not valid JSON — no sensitive fields claimed
+    # Detect sensitive fields — delegate to canonical key-inspection function
+    sensitive = find_sensitive_fields_in_json(content) if rtype == "JSON" else []
 
     # Build sanitized sample
     sample = _build_sample(content, rtype, status)
@@ -445,7 +485,7 @@ class FailedResponse:
 
 
 def safe_request(method: str, url: str, headers: Optional[dict] = None,
-                 timeout: int = 10, **kwargs) -> "_requests.Response | FailedResponse":
+                 timeout: int = 10, policy_gate=None, **kwargs) -> "_requests.Response | FailedResponse":
     """
     Safe HTTP request wrapper for agents.
 
@@ -487,6 +527,35 @@ def safe_request(method: str, url: str, headers: Optional[dict] = None,
     verify = False if is_lab else True
     if is_lab:
         _requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    # CRITICAL #2: Detect exploit-shaped payloads and block
+    body_str = None
+    if "json" in kwargs:
+        body_str = json.dumps(kwargs.get("json"))
+    elif "data" in kwargs:
+        body_str = str(kwargs.get("data"))
+    
+    exploit_action = detect_exploit_action(method, url, body_str)
+    if exploit_action:
+        _block_and_log_chokepoint(
+            action=exploit_action,
+            target=url,
+            reason=f"Exploit-shaped payload detected: {exploit_action}"
+        )
+        raise HardStop(
+            f"Payload blocked by shape detector: '{exploit_action}' detected in request. "
+            f"Sentinel is a find-only tool."
+        )
+
+    # CRITICAL #3: Check policy rate limit before dispatch
+    _gate = policy_gate if policy_gate is not None else _policy_gate_ctx.get()
+    if _gate is not None:
+        from .policy import policy_check_probe
+        if not policy_check_probe(url, method, _gate):
+            return FailedResponse(
+                failure_class="rate_limit",
+                failure_reason="Rate limit exceeded"
+            )
 
     try:
         return _requests.request(

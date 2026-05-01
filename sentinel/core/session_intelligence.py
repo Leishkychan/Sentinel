@@ -358,11 +358,20 @@ class SessionIntelligence:
         # Notify eval harness of first confirmed finding (for time-to-confirm metric)
         try:
             import sentinel.agents._eval_ref as _eref
-            harness = getattr(_eref, 'current_harness', None)
-            if harness:
+        except ImportError as e:
+            import sys
+            print(f"[WARN] eval harness import failed: {e}", file=sys.stderr)
+        else:
+            import sys
+            harness = getattr(_eref, "current_harness", None)
+            if harness is None:
+                print("[WARN] eval harness not set — time-to-confirm will not be recorded",
+                      file=sys.stderr)
+            elif not hasattr(harness, "record_first_confirmed"):
+                print("[WARN] eval harness missing record_first_confirmed — skipping",
+                      file=sys.stderr)
+            else:
                 harness.record_first_confirmed()
-        except Exception:
-            pass
 
         return ep
 

@@ -576,11 +576,20 @@ def calibrate_ai_decision(decision: dict,
         # Auto-report to eval_harness via module-level reference
         try:
             import sentinel.agents._eval_ref as _eref
-            harness = getattr(_eref, 'current_harness', None)
-            if harness:
+        except ImportError as e:
+            import sys
+            print(f"[WARN] eval harness import failed: {e}", file=sys.stderr)
+        else:
+            import sys
+            harness = getattr(_eref, "current_harness", None)
+            if harness is None:
+                print("[WARN] eval harness not set — hallucination will not be recorded",
+                      file=sys.stderr)
+            elif not hasattr(harness, "record_hallucination_blocked"):
+                print("[WARN] eval harness missing record_hallucination_blocked — skipping",
+                      file=sys.stderr)
+            else:
                 harness.record_hallucination_blocked(scored.get("delta", 0.0))
-        except Exception:
-            pass  # Eval harness not available — not a scan-breaking error
 
     return decision
 
@@ -698,9 +707,8 @@ def _build_evidence_items(http_response: dict) -> list[EvidenceItem]:
             weight=-0.25,  # Reduces confidence
         ))
 
-    sensitive = [t for t in
-                 ["password", "token", "email", "credit", "ssn", "secret", "hash"]
-                 if t in content.lower()]
+    from sentinel.core.evidence import find_sensitive_fields_in_json
+    sensitive = find_sensitive_fields_in_json(content)
     if sensitive:
         items.append(EvidenceItem(
             observation=f"Sensitive fields in response: {', '.join(sensitive)}",

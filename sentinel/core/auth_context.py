@@ -56,6 +56,12 @@ class AuthContext:
         """
         Attempt login and extract auth tokens.
         Returns (success, findings) where findings are JWT/session security issues.
+
+        NOTE: credential_use gating via validate_action() is deferred.
+        AuthContext has no ScanSession reference, so validate_action cannot be called
+        here. Gating requires a session-aware AuthContext follow-up that passes session
+        into login() and calls validate_action(agent, "credential_use", url, session)
+        before the POST is dispatched.
         """
         base = target_url.rstrip("/")
         findings = []
@@ -289,32 +295,3 @@ def _b64_decode(data: str) -> Optional[str]:
         return None
 
 
-# ── Test credentials for known vulnerable apps ────────────────────────────────
-
-KNOWN_TEST_CREDS = {
-    "juice-shop": [
-        ("admin@juice-sh.op", "admin123"),
-        ("jim@juice-sh.op", "ncc-1701"),
-        ("bender@juice-sh.op", "OhG0dPlease1njectTh1s"),
-    ],
-    "dvwa": [
-        ("admin", "password"),
-        ("admin", "admin"),
-    ],
-    "webgoat": [
-        ("admin", "admin"),
-        ("guest", "guest"),
-    ],
-}
-
-
-def get_test_credentials(target_url: str) -> list[tuple[str, str]]:
-    """Get known test credentials for common vulnerable apps."""
-    url_lower = target_url.lower()
-    if "juice" in url_lower or "3000" in url_lower:
-        return KNOWN_TEST_CREDS["juice-shop"]
-    if "dvwa" in url_lower:
-        return KNOWN_TEST_CREDS["dvwa"]
-    if "webgoat" in url_lower:
-        return KNOWN_TEST_CREDS["webgoat"]
-    return []
