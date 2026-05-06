@@ -24,9 +24,11 @@ NEVER: exploits, probes, modifies anything
 
 import os
 import json
+import time
 from pathlib import Path
 from typing import Optional
 from anthropic import Anthropic
+from anthropic import RateLimitError as _RateLimitError, APIStatusError as _APIStatusError
 
 from sentinel.core import (
     validate_action, AgentName, ScanSession, Finding, Severity, ScanMode,
@@ -56,6 +58,9 @@ AUTH_KEYWORDS = [
 ]
 
 MAX_FILE_SIZE_KB = 100  # Skip files larger than this
+TOTAL_TOKEN_BUDGET = 40_000  # Max tokens across all Claude calls per logic scan run
+CHUNK_SIZE  = 6_000   # Characters per chunk
+CHUNK_OVERLAP = 800   # Overlap between adjacent chunks to avoid cutting mid-function
 
 
 LOGIC_ANALYSIS_PROMPT = """You are a senior application security engineer performing a security code review.
@@ -96,6 +101,7 @@ def run_logic_agent(session: ScanSession, source_path: str) -> list[Finding]:
     """
     Run logic analysis on source code.
     Prioritizes auth/access control files, then analyzes all others.
+    Enforces TOTAL_TOKEN_BUDGET across all Claude calls — stops cleanly when exhausted.
     """
     if session.mode == ScanMode.PASSIVE:
         return []
@@ -114,12 +120,36 @@ def run_logic_agent(session: ScanSession, source_path: str) -> list[Finding]:
 
     print(f"[LOGIC] Analyzing {len(files)} files for logic flaws...")
     all_findings = []
+    tokens_used = 0
 
     for filepath in files[:20]:  # Cap at 20 files for context/cost
-        findings = _analyze_file(filepath, session)
+        if tokens_used >= TOTAL_TOKEN_BUDGET:
+            print(f"[LOGIC] Token budget exhausted ({tokens_used}/{TOTAL_TOKEN_BUDGET}) — "
+                  f"stopping before {filepath.name}")
+            break
+        findings, tokens_consumed = _analyze_file(filepath, session, TOTAL_TOKEN_BUDGET - tokens_used)
+        tokens_used += tokens_consumed
         all_findings.extend(findings)
 
-    print(f"[LOGIC] {len(all_findings)} logic flaws found")
+    print(f"[LOGIC] {len(all_findings)} logic flaws found | {tokens_used} tokens used")
+
+    # Surface any unanalyzed files/chunks as an INFO finding
+    unanalyzed = getattr(session, '_logic_unanalyzed', set())
+    if unanalyzed:
+        all_findings.append(Finding(
+            agent=AgentName.LOGIC,
+            title="[Logic] Files/Chunks Not Analyzed Due to API Errors",
+            description=(
+                f"{len(unanalyzed)} file(s)/chunk(s) could not be analyzed due to API errors "
+                f"(rate limit, server error, or unexpected failure). "
+                f"Logic flaws in these may be missed.\n"
+                f"Unanalyzed: {', '.join(sorted(unanalyzed))}"
+            ),
+            severity=Severity.INFO,
+            file_path=source_path,
+            remediation="Re-run logic analysis or investigate API errors. Check ANTHROPIC_API_KEY and rate limits.",
+        ))
+
     return all_findings
 
 
@@ -154,29 +184,133 @@ def _find_analyzable_files(base: Path) -> list[Path]:
     return auth_files + all_files
 
 
-def _analyze_file(filepath: Path, session: ScanSession) -> list[Finding]:
-    """Send a single file to Claude for logic analysis."""
+def _make_chunks(content: str) -> list[str]:
+    """
+    Split content into overlapping chunks of CHUNK_SIZE chars with CHUNK_OVERLAP.
+    Chunks containing auth/access keywords are reordered to the front.
+    Uses index-based partitioning — every chunk preserved exactly once.
+    """
+    if len(content) <= CHUNK_SIZE:
+        return [content]
+
+    chunks = []
+    start = 0
+    while start < len(content):
+        end = start + CHUNK_SIZE
+        chunks.append(content[start:end])
+        start += CHUNK_SIZE - CHUNK_OVERLAP
+
+    # Partition by index — value-based exclusion drops duplicate content chunks
+    auth_indices  = [i for i, c in enumerate(chunks)
+                     if any(kw in c.lower() for kw in AUTH_KEYWORDS[:6])]
+    other_indices = [i for i in range(len(chunks)) if i not in auth_indices]
+    return [chunks[i] for i in auth_indices] + [chunks[i] for i in other_indices]
+
+
+def _analyze_file(filepath: Path, session: ScanSession,
+                  remaining_budget: int) -> tuple[list[Finding], int]:
+    """
+    Analyze a single file for logic flaws.
+    For files <= CHUNK_SIZE chars: one Claude call.
+    For larger files: split into overlapping prioritized chunks.
+    Stops when remaining_budget is exhausted.
+    Returns (findings, tokens_consumed).
+    """
     try:
         content = filepath.read_text(encoding="utf-8", errors="ignore")
         if not content.strip() or len(content) < 50:
-            return []
+            return [], 0
 
-        response = _get_client().messages.create(
-            model=MODEL,
-            max_tokens=2000,
-            system=LOGIC_ANALYSIS_PROMPT,
-            messages=[{
-                "role": "user",
-                "content": f"File: {filepath.name}\nLanguage: {filepath.suffix}\n\n```\n{content[:6000]}\n```"
-            }],
-        )
+        chunks = _make_chunks(content)
+        total_chars = len(content)
+        if len(chunks) > 1:
+            print(f"[LOGIC] {filepath.name}: {total_chars} chars → "
+                  f"{len(chunks)} chunks (CHUNK_SIZE={CHUNK_SIZE}, overlap={CHUNK_OVERLAP})")
 
-        raw = response.content[0].text.strip()
-        return _parse_logic_findings(raw, str(filepath))
+        all_findings: list[Finding] = []
+        tokens_consumed = 0
+
+        for i, chunk in enumerate(chunks):
+            if tokens_consumed >= remaining_budget:
+                print(f"[LOGIC] Budget exhausted mid-file at chunk {i+1}/{len(chunks)} "
+                      f"of {filepath.name} — stopping")
+                break
+
+            chunk_label = f" (chunk {i+1}/{len(chunks)})" if len(chunks) > 1 else ""
+            print(f"[LOGIC] Analyzing {filepath.name}{chunk_label} "
+                  f"[{len(chunk)} chars, budget remaining: {remaining_budget - tokens_consumed}]")
+
+            try:
+                response = _get_client().messages.create(
+                    model=MODEL,
+                    max_tokens=2000,
+                    system=LOGIC_ANALYSIS_PROMPT,
+                    messages=[{
+                        "role": "user",
+                        "content": (
+                            f"File: {filepath.name}{chunk_label}\n"
+                            f"Language: {filepath.suffix}\n\n"
+                            f"```\n{chunk}\n```"
+                        )
+                    }],
+                )
+                call_tokens = (response.usage.input_tokens + response.usage.output_tokens)
+                tokens_consumed += call_tokens
+
+                raw = response.content[0].text.strip()
+                chunk_findings = _parse_logic_findings(raw, str(filepath))
+                all_findings.extend(chunk_findings)
+
+            except _RateLimitError as e:
+                wait = 2 ** (i % 4 + 1)  # 2-16s backoff, bounded
+                print(f"[LOGIC] Rate limit on {filepath.name}{chunk_label} — "
+                      f"backing off {wait}s then retrying once")
+                time.sleep(wait)
+                try:
+                    response = _get_client().messages.create(
+                        model=MODEL,
+                        max_tokens=2000,
+                        system=LOGIC_ANALYSIS_PROMPT,
+                        messages=[{
+                            "role": "user",
+                            "content": (
+                                f"File: {filepath.name}{chunk_label}\n"
+                                f"Language: {filepath.suffix}\n\n"
+                                f"```\n{chunk}\n```"
+                            )
+                        }],
+                    )
+                    call_tokens = (response.usage.input_tokens + response.usage.output_tokens)
+                    tokens_consumed += call_tokens
+                    raw = response.content[0].text.strip()
+                    chunk_findings = _parse_logic_findings(raw, str(filepath))
+                    all_findings.extend(chunk_findings)
+                except Exception as retry_e:
+                    label = f"{filepath.name}{chunk_label}"
+                    print(f"[LOGIC] Retry failed for {label}: {retry_e}")
+                    unanalyzed = getattr(session, '_logic_unanalyzed', set())
+                    unanalyzed.add(label)
+                    session._logic_unanalyzed = unanalyzed
+
+            except _APIStatusError as e:
+                label = f"{filepath.name}{chunk_label}"
+                print(f"[LOGIC] API error {e.status_code} on {label}: {str(e)}")
+                unanalyzed = getattr(session, '_logic_unanalyzed', set())
+                unanalyzed.add(label)
+                session._logic_unanalyzed = unanalyzed
+
+            except Exception as e:
+                label = f"{filepath.name}{chunk_label}"
+                print(f"[LOGIC] Unexpected error on {label}: {e}", flush=True)
+                unanalyzed = getattr(session, '_logic_unanalyzed', set())
+                unanalyzed.add(label)
+                session._logic_unanalyzed = unanalyzed
+
+        return all_findings, tokens_consumed
 
     except Exception as e:
-        print(f"[LOGIC] Failed to analyze {filepath}: {e}")
-        return []
+        print(f"[LOGIC] Failed to read {filepath}: {e}")
+        return [], 0
 
 
 def _parse_logic_findings(raw: str, filepath: str) -> list[Finding]:

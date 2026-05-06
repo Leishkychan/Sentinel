@@ -273,13 +273,15 @@ def _scan_java(manifest_path: str, session: ScanSession) -> list[Finding]:
     Requires dependency-check CLI installed separately.
     Returns INFO finding if not available.
     """
+    import tempfile
     try:
+        out_dir = tempfile.mkdtemp(prefix="sentinel-dc-")
         result = subprocess.run(
             ["dependency-check", "--scan", str(Path(manifest_path).parent),
-             "--format", "JSON", "--out", "/tmp/dc-report", "--noupdate"],
+             "--format", "JSON", "--out", out_dir, "--noupdate"],
             capture_output=True, text=True, timeout=300,
         )
-        report_path = Path("/tmp/dc-report/dependency-check-report.json")
+        report_path = Path(out_dir) / "dependency-check-report.json"
         if not report_path.exists():
             return []
 

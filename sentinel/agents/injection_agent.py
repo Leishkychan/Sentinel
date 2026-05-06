@@ -100,9 +100,6 @@ INPUT_ENDPOINTS = [
     "/api/forgot-password",
 ]
 
-# Search/filter parameters commonly vulnerable to injection
-INPUT_PARAMS = ["q", "search", "query", "s", "term", "filter", "id", "name", "email"]
-
 _AGENT = "injection_agent"
 
 
@@ -217,19 +214,60 @@ def _check_search_injection(base: str, session: ScanSession,
                         "json" in resp.headers.get("Content-Type", "") and
                         "json" in normal_resp.headers.get("Content-Type", "")
                     )
-                    size_ratio = (max(size_probe, size_normal) /
-                                  max(min(size_probe, size_normal), 1))
-                    if (is_json_both and size_ratio > 3.0 and
-                            abs(size_probe - size_normal) > 1000):
+                    same_status = resp.status_code == normal_resp.status_code
+
+                    # Behavioral detection requires structural evidence, not just size.
+                    # Size-only variance triggers on normal search results (more vs fewer items).
+                    anomaly_signal = None
+
+                    if is_json_both and same_status:
+                        # Parse both responses to inspect structure
+                        try:
+                            import json as _json
+                            probe_json  = _json.loads(resp.text)
+                            normal_json = _json.loads(normal_resp.text)
+
+                            # Probe is error-shaped when normal is not
+                            error_keys = {"error", "exception", "message", "msg",
+                                          "detail", "details", "err", "errors"}
+                            probe_keys  = set(probe_json.keys())  if isinstance(probe_json, dict) else set()
+                            normal_keys = set(normal_json.keys()) if isinstance(normal_json, dict) else set()
+
+                            probe_error_shaped  = bool(probe_keys  & error_keys)
+                            normal_error_shaped = bool(normal_keys & error_keys)
+
+                            if probe_error_shaped and not normal_error_shaped:
+                                anomaly_signal = (
+                                    f"Probe response contains error-shaped fields "
+                                    f"({', '.join(probe_keys & error_keys)}) "
+                                    f"while normal response does not."
+                                )
+
+                            # Top-level type divergence (list vs dict or vice versa)
+                            elif type(probe_json) != type(normal_json):
+                                anomaly_signal = (
+                                    f"Probe response top-level type ({type(probe_json).__name__}) "
+                                    f"differs from normal ({type(normal_json).__name__})."
+                                )
+
+                        except (_json.JSONDecodeError, ValueError):
+                            pass  # Cannot parse — skip behavioral check
+
+                    elif not same_status and resp.status_code >= 500 and normal_resp.status_code < 500:
+                        # Probe caused a server error that normal input did not
+                        anomaly_signal = (
+                            f"Probe input triggered HTTP {resp.status_code} "
+                            f"while normal input returned HTTP {normal_resp.status_code}."
+                        )
+
+                    if anomaly_signal:
                         findings.append(Finding(
                             agent=AgentName.INJECTION,
                             title=f"Injection Behavioral Anomaly: {endpoint.split('?')[0]}",
                             description=(
-                                f"JSON response size differs {size_ratio:.1f}x between normal "
-                                f"input ({size_normal} bytes) and probe input "
-                                f"({size_probe} bytes) at {endpoint.split('?')[0]}. "
-                                "Significant JSON size difference may indicate query structure "
-                                "change due to unparameterized input."
+                                f"Structural difference between normal and probe responses "
+                                f"at {endpoint.split('?')[0]}. {anomaly_signal} "
+                                "May indicate unparameterized input handling."
                             ),
                             severity=Severity.MEDIUM,
                             file_path=url,
@@ -237,8 +275,8 @@ def _check_search_injection(base: str, session: ScanSession,
                             mitre_tactic="Initial Access",
                             mitre_technique="T1190 — Exploit Public-Facing Application",
                             remediation=(
-                                "Investigate why probe input causes significantly different "
-                                "response size. Use parameterized queries."
+                                "Investigate why probe input causes structurally different "
+                                "response. Use parameterized queries."
                             ),
                         ))
                 else:

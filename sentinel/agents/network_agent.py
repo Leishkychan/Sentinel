@@ -281,16 +281,35 @@ def _analyze_lateral_movement(session: ScanSession, target: str,
 
 
 def _check_common_subdomains(hostname: str) -> list[str]:
-    """Check common subdomain names when subfinder unavailable."""
+    """Check common subdomain names when subfinder unavailable.
+    Uses ThreadPoolExecutor to run lookups in parallel rather than serially.
+    Note: socket.gethostbyname does not support per-call timeout without
+    mutating global socket state. Per-lookup timeout is not enforced here.
+    The whole batch is bounded by as_completed(timeout=30) only.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FuturesTimeout
+
     common = ["www", "api", "dev", "staging", "test", "admin", "mail",
               "vpn", "remote", "portal", "dashboard", "app", "beta"]
-    found = []
-    for sub in common:
+
+    def _lookup(sub: str) -> str | None:
+        fqdn = f"{sub}.{hostname}"
         try:
-            socket.gethostbyname(f"{sub}.{hostname}")
-            found.append(f"{sub}.{hostname}")
-        except socket.gaierror:
-            pass
+            socket.gethostbyname(fqdn)
+            return fqdn
+        except (socket.gaierror, OSError):
+            return None
+
+    found = []
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        futures = {pool.submit(_lookup, sub): sub for sub in common}
+        try:
+            for future in as_completed(futures, timeout=30):
+                result = future.result()
+                if result:
+                    found.append(result)
+        except FuturesTimeout:
+            pass  # Batch timed out — return whatever resolved so far
     return found
 
 

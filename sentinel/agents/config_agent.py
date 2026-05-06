@@ -178,7 +178,13 @@ def _check_http_headers(session: ScanSession, target_url: str) -> list[Finding]:
             cookie_issues = []
             if not cookie.secure:
                 cookie_issues.append("Secure flag missing")
-            if not cookie.has_nonstandard_attr("HttpOnly"):
+            # HttpOnly may be stored in cookie._rest with varying key casing.
+            # has_nonstandard_attr("HttpOnly") is unreliable — check _rest directly.
+            has_httponly = any(
+                k.lower() == "httponly"
+                for k in getattr(cookie, '_rest', {}).keys()
+            )
+            if not has_httponly:
                 cookie_issues.append("HttpOnly flag missing")
             if cookie_issues:
                 findings.append(Finding(

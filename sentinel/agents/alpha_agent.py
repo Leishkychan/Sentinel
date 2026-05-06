@@ -27,7 +27,7 @@ from anthropic import Anthropic
 from sentinel.core.models import (
     ScanMode, AgentName, ScanSession, Finding, Severity,
 )
-from sentinel.core.evidence import probe_with_evidence, EvidenceArtifact
+from sentinel.core.evidence import probe_with_evidence, EvidenceArtifact, find_sensitive_fields_in_json
 from sentinel.core.pipeline import FindingPipeline, FindingState, NegativeValidation, PromotionRules
 from sentinel.core.session_intelligence import SessionIntelligence, ProbeOutcome, DisproveReason
 from sentinel.core.scoring import (
@@ -363,7 +363,7 @@ class AlphaAgent:
         if intel and self.cycle > 2:
             no_recent_progress = len(self.confirmed_evidence) == 0 and self.cycle >= 4
             if no_recent_progress:
-                print(f"[{self.alpha_id}] Queue exhausted, no confirmed findings — stopping early at cycle {self.cycle}")
+                print(f"[{self.alpha_id}] Queue exhausted, no confirmed findings -- stopping early at cycle {self.cycle}")
                 return {"status": "complete", "cycle": self.cycle,
                         "report": "Queue exhausted with no confirmed findings."}
 
@@ -471,12 +471,12 @@ Write final complete threat assessment. Return complete status JSON."""
             calib    = hyp.get("calibration_note", "")
 
             cvss_str = f"est. CVSS: {cvss} [{vector}]" if cvss else "CVSS: no NVD match"
-            status_icon = "✅" if status == "OBSERVED" else "⚠️" if status == "INFERRED" else "❌"
+            status_icon = "[OK]" if status == "OBSERVED" else "[WARN]" if status == "INFERRED" else "[FAIL]"
             print(f"[{self.alpha_id}] {status_icon} {status} | {verif}")
             print(f"[{self.alpha_id}] Score: {score} | Conf: {conf} | Impact: {impact} | {cvss_str}")
             print(f"[{self.alpha_id}] Blast radius: {blast}")
             if not reliable and calib:
-                print(f"[{self.alpha_id}] ⚠ {calib}")
+                print(f"[{self.alpha_id}] [WARN] {calib}")
 
         patterns = decision.get("learned_patterns", [])
         for p in patterns:
@@ -541,16 +541,6 @@ Write final complete threat assessment. Return complete status JSON."""
     def _calculate_blast_radius(self, finding: Finding):
         """Delegates to module-level _measure_blast_radius — no __new__ workaround needed."""
         _measure_blast_radius(finding, alpha_id=self.alpha_id)
-
-    def _detect_data_types(self, text: str) -> list[str]:
-        text = text.lower()
-        types = []
-        if any(k in text for k in ["email", "username"]): types.append("user_accounts")
-        if any(k in text for k in ["password", "hash"]):  types.append("credentials")
-        if any(k in text for k in ["credit", "payment"]): types.append("payment_data")
-        if any(k in text for k in ["address", "phone"]):  types.append("PII")
-        if any(k in text for k in ["token", "secret"]):   types.append("secrets")
-        return types or ["unknown"]
 
     # ── Self-Correcting Learning ──────────────────────────────────────────────
 
@@ -725,7 +715,10 @@ Write final complete threat assessment. Return complete status JSON."""
                 for nid, n in self.attack_graph.items()
             },
             blast_radius={
-                f.title[:40]: {"types": self._detect_data_types(f.description or "")}
+                f.title[:40]: {
+                    "types": find_sensitive_fields_in_json(f.evidence.proof_snippet)
+                    if f.evidence and f.evidence.proof_snippet else []
+                }
                 for f in self.all_findings
                 if str(f.severity).split(".")[-1] == "CRITICAL"
             },
@@ -863,7 +856,7 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
         if not hasattr(session, '_alpha_blocked_methods'):
             session._alpha_blocked_methods = set()
         session._alpha_blocked_methods.add(method)
-        print(f"[ALPHA/PROBE] {method} blocked — read-only mode")
+        print(f"[ALPHA/PROBE] {method} blocked -- read-only mode")
         return []
 
     host = urlparse(url).hostname or url
@@ -923,13 +916,14 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
     )
 
     # Print pipeline verdict and update session intelligence
-    from sentinel.core.session_intelligence import EvidenceRef as _ERef, DisproveReason as _DR
+    from sentinel.core.models import EvidenceRef as _ERef
+    from sentinel.core.session_intelligence import DisproveReason as _DR
 
     intel = getattr(session, '_session_intel', None)
     _ev = None  # EvidenceRef constructed from real HTTP response — passed to Finding
 
     if state == FindingState.CONFIRMED:
-        print(f"[PIPELINE] ✅ CONFIRMED: {url.split('/')[-1]} → {confirmed_bundle.promotion_reason}")
+        print(f"[PIPELINE] [OK] CONFIRMED: {url.split('/')[-1]} → {confirmed_bundle.promotion_reason}")
         if confirmed_bundle:
             # Construct from real pipeline response — not synthetic values
             _ev = _ERef(
@@ -946,7 +940,7 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
                 intel.record_confirmed(url, _ev)
 
     elif state == FindingState.REFUTED:
-        print(f"[PIPELINE] ❌ REFUTED:   {negative.format().splitlines()[0]}")
+        print(f"[PIPELINE] [FAIL] REFUTED:   {negative.format().splitlines()[0]}")
         if intel and negative:
             reason_map = {
                 "AUTH_ENFORCED": _DR.AUTH_ENFORCED,
@@ -964,11 +958,11 @@ def execute_targeted_probe(probe: dict, session: ScanSession) -> list[Finding]:
         if status_code == 400:
             # INPUT_REQUIRED — endpoint works, rejected malformed request
             # Record as disproven with specific reason so it's never retried
-            print(f"[PIPELINE] 🔍 TESTED:    HTTP 400 — input required, not a security finding")
+            print(f"[PIPELINE] [INFO] TESTED:    HTTP 400 -- input required, not a security finding")
             if intel:
                 intel.record_disproven(url, _DR.EMPTY_RESPONSE)  # Closest: no valid input = no data
         else:
-            print(f"[PIPELINE] 🔍 TESTED:    HTTP {status_code} — inconclusive")
+            print(f"[PIPELINE] [INFO] TESTED:    HTTP {status_code} -- inconclusive")
             if intel:
                 intel.record_inconclusive(url, reason=f"HTTP {status_code}")
 
@@ -1072,7 +1066,7 @@ def _measure_blast_radius(finding: Finding, alpha_id: str = "ALPHA") -> None:
 
             blast = "MEASURED: " + " | ".join(parts) if parts else f"response received ({er.size_bytes}b)"
             finding.description += f"\n📊 Blast radius (measured): {blast}"
-            print(f"[{alpha_id}] 📊 Blast radius: {blast}")
+            print(f"[{alpha_id}] [INFO] Blast radius: {blast}")
         else:
             finding.description += "\n📊 Blast radius: endpoint returned no data"
     except Exception:

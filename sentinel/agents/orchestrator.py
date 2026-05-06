@@ -22,7 +22,6 @@ def _get_client():
         _client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
     return _client
 MODEL  = os.getenv("ORCHESTRATOR_MODEL", "claude-sonnet-4-20250514")
-MAX_ITERATIONS = 5
 
 SYSTEM = """You are Sentinel's Orchestrator — a blue team AI security coordinator.
 Plan scans, adapt based on findings, think like a defender finding every vulnerability first.
@@ -86,7 +85,7 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
         # PROBE mode always runs all probe agents — don't let Claude skip them
         if session.mode == ScanMode.PROBE:
             queue = _default_agents(session, source_path)
-            print(f"[ORCHESTRATOR] PROBE mode — full agent suite: {queue}")
+            print(f"[ORCHESTRATOR] PROBE mode -- full agent suite: {queue}")
         else:
             plan  = _initial_plan(session, source_path)
             queue = list(plan.get("agents_to_run", _default_agents(session, source_path)))
@@ -155,9 +154,9 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
             if standards.get("control_family") != "Uncategorized":
                 if not f.mitre_tactic or f.mitre_tactic == "Unknown":
                     f.mitre_tactic = standards.get("control_family", f.mitre_tactic)
-                refs = standards.get("formatted_short", "")
-                if refs and refs not in (f.description or ""):
-                    f.description = (f.description or "") + f"\n📋 {refs}"
+                f.asvs_refs     = standards.get("asvs_refs", [])
+                f.wstg_refs     = standards.get("wstg_refs", [])
+                f.control_family = standards.get("control_family")
 
         # Deduplicate and group root causes
         all_findings = _deduplicate_findings(all_findings)
@@ -201,7 +200,7 @@ def run_orchestrator(session: ScanSession, source_path: Optional[str] = None) ->
             if _chain_is_valid(c, confirmed_urls)
         ]
         if len(valid_chains) < len(chains):
-            print(f"[CHAIN] Filtered {len(chains) - len(valid_chains)} invalid chains — "
+            print(f"[CHAIN] Filtered {len(chains) - len(valid_chains)} invalid chains -- "
                   f"{len(valid_chains)} valid chains remain")
         chains = valid_chains
         result.attack_chains = chains_to_dict(chains)
@@ -362,21 +361,21 @@ def _dispatch(agent: str, session: ScanSession, source_path: Optional[str]) -> l
             from sentinel.agents.wordpress_enum_agent import run_wordpress_enum_agent
             url = session.target if session.target.startswith("http") else f"http://{session.target}"
             if not _detect_wordpress(url):
-                print(f"[ORCHESTRATOR] wordpress_enum_agent skipped — no WordPress signal on {url}")
+                print(f"[ORCHESTRATOR] wordpress_enum_agent skipped -- no WordPress signal on {url}")
                 return []
             return run_wordpress_enum_agent(session, url)
         elif agent == "wordpress_agent":
             from sentinel.agents.wordpress_agent import run_wordpress_agent
             url = session.target if session.target.startswith("http") else f"http://{session.target}"
             if not _detect_wordpress(url):
-                print(f"[ORCHESTRATOR] wordpress_agent skipped — no WordPress signal on {url}")
+                print(f"[ORCHESTRATOR] wordpress_agent skipped -- no WordPress signal on {url}")
                 return []
             return run_wordpress_agent(session, url)
         elif agent == "salesforce_agent":
             from sentinel.agents.salesforce_agent import run_salesforce_agent
             url = session.target if session.target.startswith("http") else f"http://{session.target}"
             if not _detect_salesforce(url):
-                print(f"[ORCHESTRATOR] salesforce_agent skipped — no Salesforce signal on {url}")
+                print(f"[ORCHESTRATOR] salesforce_agent skipped -- no Salesforce signal on {url}")
                 return []
             return run_salesforce_agent(session, url)
         else:
@@ -823,10 +822,26 @@ def _group_root_causes(findings: list[Finding], session: ScanSession) -> list[di
     ]
 
 
+def _normalize_chain_url(url: str) -> str:
+    """
+    Normalize a URL for chain validation comparison.
+    Strips query string, fragment, and trailing slash.
+    Case-insensitive.
+    """
+    from urllib.parse import urlparse, urlunparse
+    try:
+        p = urlparse(url.strip().lower())
+        # Reconstruct without query or fragment, strip trailing slash from path
+        return urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), "", "", ""))
+    except Exception:
+        return url.strip().lower()
+
+
 def _chain_is_valid(chain, confirmed_urls: set) -> bool:
     """
     A chain is valid only if it references confirmed finding URLs.
     Chains with no finding_ids or unconfirmed URLs are invalid — never reach reporter.
+    URL comparison uses normalized exact match — no substring matching.
     """
     import re
     attack_path = chain.attack_path if hasattr(chain, 'attack_path') else []
@@ -836,8 +851,9 @@ def _chain_is_valid(chain, confirmed_urls: set) -> bool:
         path_urls.extend(re.findall(r'https?://[^\s\'"]+', str(step)))
 
     if path_urls:
+        normalized_confirmed = {_normalize_chain_url(c) for c in confirmed_urls}
         return all(
-            any(confirmed in url or url in confirmed for confirmed in confirmed_urls)
+            _normalize_chain_url(url) in normalized_confirmed
             for url in path_urls
         )
     # No URLs in path — require HIGH confidence

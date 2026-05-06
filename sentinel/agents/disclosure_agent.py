@@ -81,9 +81,6 @@ SENSITIVE_FILES = [
     ("/info.php",              "PHP Info Page",             Severity.HIGH),
     ("/test.php",              "Test Page",                 Severity.MEDIUM),
     ("/debug",                 "Debug Endpoint",            Severity.HIGH),
-    ("/health",                "Health Check",              Severity.LOW),
-    ("/metrics",               "Metrics Endpoint",          Severity.MEDIUM),
-    ("/status",                "Status Page",               Severity.LOW),
 
     # Kubernetes/cloud
     ("/actuator",              "Spring Actuator",           Severity.HIGH),
@@ -163,6 +160,7 @@ def run_disclosure_agent(session: ScanSession, target_url: str) -> list[Finding]
     print(f"[DISCLOSURE] Scanning for sensitive file exposure and info disclosure on {base}")
 
     findings.extend(_check_sensitive_files(base, session))
+    findings.extend(_check_monitoring_endpoints(base, session))
     findings.extend(_check_error_disclosure(base, session))
     findings.extend(_check_directory_listing(base, session))
     findings.extend(_check_debug_endpoints(base, session))
@@ -218,6 +216,88 @@ def _check_sensitive_files(base: str, session: ScanSession) -> list[Finding]:
 
         except requests.RequestException as e:
             _record_failure(session, url, classify_failure(str(e)), str(e))
+            continue
+
+    return findings
+
+
+# ── Monitoring Endpoint Checks ────────────────────────────────────────────────
+
+# Telemetry indicators — presence escalates to MEDIUM
+_TELEMETRY_INDICATORS = [
+    "diskspace", "heap", "memoryusage", "goroutine",
+    "process_", "jvm_", '"db"', '"db":',
+]
+
+# Liveness body patterns — simple health probes, not disclosure
+_LIVENESS_BODIES = {"ok", "healthy", "up", '{"status":"ok"}', '{"status":"up"}',
+                    '{"status":"UP"}', '{"status":"healthy"}'}
+
+
+def _check_monitoring_endpoints(base: str, session: ScanSession) -> list[Finding]:
+    """
+    Check /health, /metrics, /status with context-aware classification.
+    Simple liveness probes → no finding.
+    Accessible but benign → INFO.
+    Contains internal telemetry → MEDIUM.
+    """
+    findings = []
+    monitoring = [
+        ("/health",  "Health Check Endpoint"),
+        ("/metrics", "Metrics Endpoint"),
+        ("/status",  "Status Page"),
+    ]
+
+    for path, label in monitoring:
+        url = base + path
+        try:
+            resp = safe_request("GET", url, headers=HEADERS, timeout=TIMEOUT,
+                                allow_redirects=False)
+
+            if resp is None or resp.status_code == 0:
+                _record_failure(session, url,
+                                getattr(resp, "failure_class", "other") if resp is not None else "other",
+                                getattr(resp, "failure_reason", "") if resp is not None else "None returned by safe_request")
+                continue
+
+            if resp.status_code != 200 or len(resp.content) == 0:
+                continue
+
+            body = resp.text.strip()
+            body_lower = body.lower()
+
+            # Simple liveness probe — not a disclosure issue
+            if body_lower in {v.lower() for v in _LIVENESS_BODIES}:
+                continue
+
+            # Telemetry escalation check
+            has_telemetry = any(ind in body_lower for ind in _TELEMETRY_INDICATORS)
+            severity = Severity.MEDIUM if has_telemetry else Severity.INFO
+            detail = (
+                "Response contains internal telemetry (memory, process, or DB metrics) "
+                "that could aid reconnaissance."
+                if has_telemetry else
+                "Endpoint is accessible but response appears benign."
+            )
+
+            findings.append(Finding(
+                agent=AgentName.DISCLOSURE,
+                title=f"Monitoring Endpoint Accessible: {path}",
+                description=(
+                    f"{label} is publicly accessible at {url}. {detail} "
+                    f"Preview: {body[:150]}"
+                ),
+                severity=severity,
+                file_path=url,
+                mitre_tactic="Reconnaissance",
+                mitre_technique="T1082 — System Information Discovery",
+                remediation=(
+                    f"Restrict {path} to internal networks or authenticated requests only. "
+                    "Do not expose monitoring endpoints on public-facing interfaces."
+                ),
+            ))
+
+        except Exception:
             continue
 
     return findings
