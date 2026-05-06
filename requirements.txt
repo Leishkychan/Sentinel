@@ -16,9 +16,6 @@ semgrep>=1.70.0
 pip-audit>=2.9.0
 truffleHog3>=3.0.9
 
-# ── Multi-model consensus (optional — enables GPT-4o cross-reference) ─────────
-openai>=1.30.0
-
 # ── Utilities ─────────────────────────────────────────────────────────────────
 rich>=14.0.0
 

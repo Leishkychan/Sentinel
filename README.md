@@ -143,7 +143,7 @@ docker run -d -p 3000:3000 bkimminich/juice-shop
 
 ### Live targets (require explicit written authorization)
 Sentinel has been used against:
-- **OWASP Juice Shop** — 4 confirmed unauthenticated API endpoints, TP=3, precision 30%
+- **OWASP Juice Shop** — 4 confirmed unauthenticated API endpoints, TP=3, precision 30% (pre-fix baseline; FP-generating bugs in Queen (#5, #7) and eval harness (#9) have since been patched — rerun pending)
 - **WiCyS VDP** (`www.wicys.org`, `womenincybersecuritywicys.my.site.com`) — authorized via Bugcrowd, active VDP researcher
 
 **Never run Sentinel against systems you do not own or have explicit written authorization to test.**
@@ -195,9 +195,9 @@ reports/sentinel_<session_id>_<timestamp>.md     ← human-readable report
 - [x] Phase 4 — Session Intelligence: authoritative state, dedup, stop conditions
 - [x] Phase 5 — Tier 1 specialist agents: wordpress_enum, wordpress, salesforce
 - [x] Phase 6 — MITRE ATT&CK mapping, CVSS scoring, eval harness, attack chains
-- [ ] Phase 7 — Phase 5 evidence fix: probe_agent._check_api_endpoints migration
+- [x] Phase 7 — Phase 5 evidence fix: probe_agent._check_api_endpoints migration
 - [ ] Phase 8 — Tier 2 agents: plugin fingerprinter, header auditor, sensitive file probe
-- [ ] Phase 9 — Severity accuracy: Queen risk verdict from confirmed findings only
+- [x] Phase 9 — Severity accuracy: Queen risk verdict from confirmed findings only
 - [ ] Phase 10 — Flask UI + full Azure deployment
 
 ---

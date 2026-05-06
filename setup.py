@@ -8,7 +8,6 @@ setup(
     python_requires=">=3.11",
     install_requires=[
         "anthropic>=0.49.0",
-        "langgraph>=0.2.74",
         "flask>=3.1.0",
         "flask-cors>=5.0.0",
         "flask-limiter>=3.9.4",
