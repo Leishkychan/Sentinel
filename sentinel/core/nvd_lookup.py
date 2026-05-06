@@ -55,23 +55,30 @@ def lookup_cves(product: str, version: str, max_results: int = 10) -> list[dict]
         "resultsPerPage": max_results,
     }
 
-    try:
-        resp = requests.get(NVD_API_BASE, params=params, timeout=15)
-        if resp.status_code == 200:
-            data = resp.json()
-            results = _parse_nvd_response(data)
-            _save_cache(cache_key, results)
-            return results
-        elif resp.status_code == 429:
-            print(f"[NVD] Rate limited — waiting 30s")
-            time.sleep(30)
-            return lookup_cves(product, version, max_results)
-        else:
-            print(f"[NVD] API returned {resp.status_code} for {product} {version}")
+    for attempt in range(3):
+        try:
+            resp = requests.get(NVD_API_BASE, params=params, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = _parse_nvd_response(data)
+                if not _validate_nvd_results(results):
+                    print(f"[NVD] Validation failed for {product} {version} — not caching")
+                    return []
+                _save_cache(cache_key, results)
+                return results
+            elif resp.status_code == 429:
+                print(f"[NVD] Rate limited — waiting 30s (attempt {attempt + 1}/3)")
+                time.sleep(30)
+                continue
+            else:
+                print(f"[NVD] API returned {resp.status_code} for {product} {version}")
+                return []
+        except requests.RequestException as e:
+            print(f"[NVD] Request failed: {e}")
             return []
-    except requests.RequestException as e:
-        print(f"[NVD] Request failed: {e}")
-        return []
+
+    print(f"[NVD] Max retries reached for {product} {version}")
+    return []
 
 
 def get_cve_details(cve_id: str) -> Optional[dict]:
@@ -180,6 +187,20 @@ def _parse_nvd_response(data: dict) -> list[dict]:
     # Sort by CVSS score descending
     results.sort(key=lambda x: x["cvss_score"], reverse=True)
     return results
+
+
+def _validate_nvd_results(results: list) -> bool:
+    """
+    Validate parsed NVD results before caching.
+    Rejects malformed or partial data.
+    """
+    if not isinstance(results, list):
+        return False
+    required = {"id", "description", "cvss_score", "severity"}
+    for item in results:
+        if not isinstance(item, dict) or not required.issubset(item.keys()):
+            return False
+    return True
 
 
 def _rate_limit():

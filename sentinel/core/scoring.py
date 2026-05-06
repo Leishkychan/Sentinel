@@ -633,36 +633,59 @@ def score_finding(title: str, description: str,
 def _lookup_cvss_definition(title: str, description: str) -> Optional[dict]:
     text = (title + " " + description).lower()
 
-    # Ordered by specificity — most specific first
-    # Order matters — most specific first, most general last
+    # Ordered by specificity — most specific first, most general last.
+    # Rules:
+    # - SQL condition before general SQL injection
+    # - JWT none/weak/expiry before generic JWT match
+    # - IDOR confirmed before generic IDOR
+    # - Unauthenticated admin before generic unauthenticated
+    # - SPA fallback before security header / HTML checks
+    # - CSP before generic security header
+    # - Missing HTTPS before generic security header
+
     if "sql injection condition" in text:   return CVSS_DEFINITIONS["sql_injection_condition"]
     if "sql injection" in text:             return CVSS_DEFINITIONS["sql_injection_confirmed"]
+
     if "jwt" in text and "none" in text:    return CVSS_DEFINITIONS["jwt_none_algorithm"]
-    if "jwt" in text and "expir" in text:   return CVSS_DEFINITIONS["jwt_no_expiry"]
     if "jwt" in text and "weak" in text:    return CVSS_DEFINITIONS["jwt_weak_secret"]
+    if "jwt" in text and "expir" in text:   return CVSS_DEFINITIONS["jwt_no_expiry"]
+
+    if "idor" in text and "confirmed" in text: return CVSS_DEFINITIONS["idor_confirmed"]
+    if "idor" in text:                      return CVSS_DEFINITIONS["idor_unconfirmed"]
+
+    if "mass assignment" in text:           return CVSS_DEFINITIONS["mass_assignment"]
+
     if "unauthenticated" in text and "admin" in text:
         return CVSS_DEFINITIONS["unauthenticated_admin_access"]
     if "unauthenticated" in text:           return CVSS_DEFINITIONS["unauthenticated_api_read"]
-    if "idor" in text and "confirmed" in text: return CVSS_DEFINITIONS["idor_confirmed"]
-    if "idor" in text:                      return CVSS_DEFINITIONS["idor_unconfirmed"]
-    if "mass assignment" in text:           return CVSS_DEFINITIONS["mass_assignment"]
-    if "xss" in text or "reflected xss" in text: return CVSS_DEFINITIONS["xss_reflected"]
+
+    if "reflected xss" in text:             return CVSS_DEFINITIONS["xss_reflected"]
+    if "xss" in text:                       return CVSS_DEFINITIONS["xss_reflected"]
+
     if "cors" in text and "wildcard" in text: return CVSS_DEFINITIONS["cors_wildcard"]
     if "no rate limit" in text or "rate limit" in text: return CVSS_DEFINITIONS["no_rate_limiting"]
     if "sensitive data" in text:            return CVSS_DEFINITIONS["sensitive_data_in_response"]
     if "source map" in text:                return CVSS_DEFINITIONS["source_map_exposure"]
     if "directory listing" in text:         return CVSS_DEFINITIONS["directory_listing"]
-    # Missing HTTPS before security header — both contain "security"
+
+    # SPA fallback before security-header checks — SPA findings often mention
+    # "no security headers" in their description and would otherwise match below
+    if "spa fallback" in text:              return CVSS_DEFINITIONS["spa_fallback_unconfirmed"]
+
+    # Missing HTTPS before generic security header — both may contain "security"
     if ("no https" in text or "missing https" in text or
-        ("https" in text and "redirect" in text)):
+            ("https" in text and "redirect" in text)):
         return CVSS_DEFINITIONS["missing_https"]
-    # Security header MUST come after HTTPS check
-    if "security header" in text or "x-frame" in text or "x-content" in text:
-        return CVSS_DEFINITIONS["missing_security_header"]
+
+    # CSP before generic security header — CSP is a specific type of security header
     if "content security policy" in text or " csp" in text:
         return CVSS_DEFINITIONS["missing_csp"]
+
+    # Generic security header last — broadest catch-all for this class
+    if "security header" in text or "x-frame" in text or "x-content" in text:
+        return CVSS_DEFINITIONS["missing_security_header"]
+
     if "server" in text and "version" in text: return CVSS_DEFINITIONS["server_version_disclosure"]
-    if "spa fallback" in text:              return CVSS_DEFINITIONS["spa_fallback_unconfirmed"]
 
     return None
 

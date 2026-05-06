@@ -120,9 +120,41 @@ def _build_delta(current: ScanResult, previous: Optional[dict], target: str) -> 
 def _finding_fingerprint(f: Finding) -> str:
     """
     Stable fingerprint for a finding across scans.
-    Uses title + file + line (not finding_id which changes each scan).
+
+    ID priority:
+      1. cve_id — stable, authoritative
+      2. rule_id — stable tool identifier
+      3. normalized title fallback — LLM titles vary; use only when no structured ID
+
+    Always includes normalized file_path, line_number, and severity bucket.
+    Severity bucket prevents minor drift (e.g. HIGH→CRITICAL) from creating
+    phantom NEW findings while still distinguishing critical/high from medium/low.
     """
-    raw = f"{f.title}|{f.file_path}|{f.line_number}|{f.agent}"
+    sev = f.severity
+    if sev in (Severity.CRITICAL, Severity.HIGH):
+        sev_bucket = "critical_high"
+    elif sev == Severity.MEDIUM:
+        sev_bucket = "medium"
+    else:
+        sev_bucket = "low_info"
+
+    cve_id  = getattr(f, 'cve_id',  None) or ""
+    rule_id = getattr(f, 'rule_id', None) or ""
+
+    if cve_id:
+        id_part = cve_id.strip().upper()
+    elif rule_id:
+        id_part = rule_id.strip().lower()
+    else:
+        # Normalize title: lowercase, collapse whitespace, strip agent prefix tags
+        import re
+        title = (f.title or "").lower().strip()
+        title = re.sub(r'^\[[^\]]+\]\s*', '', title)   # strip [Logic], [Queen], etc.
+        title = re.sub(r'\s+', ' ', title)
+        id_part = title
+
+    file_part = (f.file_path or "").lower().split("?")[0].rstrip("/")
+    raw = f"{id_part}|{file_part}|{f.line_number}|{sev_bucket}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -143,8 +175,24 @@ MAX_BASELINES = 5  # Maximum stored baselines per target
 
 
 def _target_slug(target: str) -> str:
-    """Stable slug for a target used in baseline filenames."""
-    return target.replace("://", "_").replace("/", "_").replace(":", "_")
+    """
+    Stable filesystem-safe slug for a target used in baseline filenames.
+    Format: {hostname}_{port or 'default'}
+    Parses via urlparse so targets with/without scheme and with/without port
+    produce the same slug — prevents port collision from raw string replacement.
+    """
+    from urllib.parse import urlparse
+    import re
+    # Prepend scheme if absent so urlparse extracts netloc correctly
+    raw = target.strip()
+    if "://" not in raw:
+        raw = "http://" + raw
+    parsed = urlparse(raw)
+    hostname = (parsed.hostname or raw).lower()
+    port     = str(parsed.port) if parsed.port else "default"
+    # Sanitize hostname for filesystem safety — keep only alphanumeric, dots, hyphens
+    hostname = re.sub(r'[^a-z0-9.\-]', '_', hostname)
+    return f"{hostname}_{port}"
 
 
 def _save_scan(result: ScanResult, target: str) -> None:

@@ -372,22 +372,12 @@ class FindingPipeline:
             )
             return FindingState.TESTED, bundle, None
 
-        # 500 handling: distinguish "route doesn't exist" from "server broken"
+        # 500 handling: server error — inconclusive, not proven safe.
+        # Do not classify as NOT_FOUND based on framework-specific body text
+        # (e.g. "unexpected path", "cannot get" are Express/Juice-Shop prose
+        # that other frameworks do not emit). Without a structured NOT_FOUND
+        # signal, the endpoint's existence cannot be determined from a 500.
         if status >= 500:
-            # "Unexpected path: /api/X" in body = route not registered = equivalent to 404
-            # This is a strong negative signal — the endpoint doesn't exist on this server
-            if "unexpected path" in content.lower() or "cannot get" in content.lower():
-                neg = NegativeValidation(
-                    endpoint=url, method=method,
-                    reason=RefutedReason.NOT_FOUND,
-                    evidence=EvidenceBundle(req, resp, FindingState.REFUTED,
-                                            f"HTTP 500 with route-not-found body — endpoint does not exist",
-                                            RefutedReason.NOT_FOUND),
-                )
-                self.refuted.append(neg)
-                return FindingState.REFUTED, None, neg
-
-            # Genuine server error — inconclusive, not proven safe
             bundle = EvidenceBundle(
                 request=req,
                 response=resp,

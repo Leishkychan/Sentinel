@@ -47,9 +47,7 @@ class AuthContext:
         self.user_role:    Optional[str] = None
         self.auth_headers: dict = {}
         self._session = requests.Session()
-        # Disable TLS verification only for lab/local targets
-        # For any real target, this should be True
-        self._session.verify = False  # LAB_ONLY — set to True for production targets
+        self._session.verify = True  # Default: verify TLS. Overridden to False for lab targets in login().
         self._session.headers.update(HEADERS)
 
     def login(self, target_url: str, email: str, password: str) -> tuple[bool, list[dict]]:
@@ -65,6 +63,13 @@ class AuthContext:
         """
         base = target_url.rstrip("/")
         findings = []
+
+        # Gate TLS verification on actual target hostname — not a comment.
+        parsed = urlparse(base if "://" in base else f"http://{base}")
+        is_lab = parsed.hostname in ("localhost", "127.0.0.1", "::1")
+        self._session.verify = not is_lab
+        if is_lab:
+            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
         # Try common login endpoints
         login_endpoints = [

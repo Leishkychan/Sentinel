@@ -142,18 +142,6 @@ def enrich_all(findings: list[Finding]) -> list[Finding]:
     return [enrich_finding(f) for f in findings]
 
 
-def get_tactic_summary(findings: list[Finding]) -> dict[str, int]:
-    """
-    Return a count of findings per MITRE tactic.
-    Useful for the report summary.
-    """
-    summary: dict[str, int] = {}
-    for f in findings:
-        tactic = f.mitre_tactic or "Unmapped"
-        summary[tactic] = summary.get(tactic, 0) + 1
-    return dict(sorted(summary.items(), key=lambda x: x[1], reverse=True))
-
-
 # ── Private ───────────────────────────────────────────────────────────────────
 
 def _find_mapping(finding: Finding) -> Optional[MitreMapping]:

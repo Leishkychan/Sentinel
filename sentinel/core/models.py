@@ -149,6 +149,9 @@ class Finding(BaseModel):
     metadata:     dict               = Field(default_factory=dict)
     raw_output:   Optional[str]      = None
     evidence:     Optional[EvidenceRef] = None  # Structured HTTP probe evidence — set by alpha_agent Phase 2+
+    asvs_refs:    list[str]          = Field(default_factory=list)   # Structured ASVS references
+    wstg_refs:    list[str]          = Field(default_factory=list)   # Structured WSTG references
+    control_family: Optional[str]   = None                           # OWASP control family
     timestamp:    datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 

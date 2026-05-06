@@ -80,6 +80,11 @@ def get_full_log() -> list[dict]:
 
 # ── Private ───────────────────────────────────────────────────────────────────
 
+# Cosmos container singleton — lazy-initialized on first write, reused thereafter.
+# Avoids CosmosClient instantiation (TLS handshake + auth) on every audit entry.
+_cosmos_container = None
+
+
 def _write_local(entry: AuditEntry) -> None:
     LOG_DIR.mkdir(exist_ok=True)
     with open(LOG_FILE, "a") as f:
@@ -95,17 +100,17 @@ def _cosmos_configured() -> bool:
 
 
 def _write_cosmos(entry: AuditEntry) -> None:
-    from azure.cosmos import CosmosClient
-
-    client = CosmosClient(
-        url=os.getenv("COSMOS_ENDPOINT"),
-        credential=os.getenv("COSMOS_KEY"),
-    )
-    db        = client.get_database_client(os.getenv("COSMOS_DB_NAME", "sentinel"))
-    container = db.get_container_client(os.getenv("COSMOS_CONTAINER", "audit_log"))
+    global _cosmos_container
+    if _cosmos_container is None:
+        from azure.cosmos import CosmosClient
+        client = CosmosClient(
+            url=os.getenv("COSMOS_ENDPOINT"),
+            credential=os.getenv("COSMOS_KEY"),
+        )
+        db = client.get_database_client(os.getenv("COSMOS_DB_NAME", "sentinel"))
+        _cosmos_container = db.get_container_client(os.getenv("COSMOS_CONTAINER", "audit_log"))
 
     doc = entry.model_dump()
     doc["id"] = entry.entry_id
-    # Cosmos needs timestamps as strings
     doc["timestamp"] = entry.timestamp.isoformat()
-    container.upsert_item(doc)
+    _cosmos_container.upsert_item(doc)

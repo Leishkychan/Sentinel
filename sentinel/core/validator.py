@@ -44,10 +44,6 @@ MODE_PERMISSIONS: dict[ScanMode, set[str]] = {
         # PROBE-specific — active but safe probing
         "http_probe",           # Send HTTP requests, observe responses
         "spider_passive",       # Crawl links, do not submit forms
-        "endpoint_discovery",   # Map API endpoints
-        "error_trigger",        # Trigger errors to check for disclosure
-        "injection_probe",      # Single-char error probing for injection conditions
-        "authenticated_scan",   # Scan with auth context
     },
     ScanMode.ACTIVE: {
         "dns_lookup",
@@ -68,13 +64,6 @@ MODE_PERMISSIONS: dict[ScanMode, set[str]] = {
         "subfinder_scan",
         "logic_analysis",
         "network_topology",
-        # PROBE actions also available in ACTIVE
-        "http_probe",
-        "spider_passive",
-        "endpoint_discovery",
-        "error_trigger",
-        "injection_probe",
-        "authenticated_scan",
     },
 }
 

@@ -76,6 +76,9 @@ class EvalRun:
     chains_built_from_confirmed: int = 0   # All steps confirmed
     chains_with_unconfirmed:     int = 0   # At least one step not confirmed
 
+    # Request failure telemetry — from session_intel (#26)
+    request_failures_total: int = 0
+
     @property
     def precision(self) -> float:
         if self.true_positives + self.false_positives == 0:
@@ -135,6 +138,8 @@ class EvalRun:
             f"  Chain Quality:",
             f"    Valid chains:           {self.chains_built_from_confirmed}",
             f"    Invalid chains:         {self.chains_with_unconfirmed}",
+            f"",
+            f"  Request Failures:         {self.request_failures_total}",
             f"╚{'═' * len(header)}╝",
         ]
         return "\n".join(lines)
@@ -379,6 +384,7 @@ class EvalHarness:
             time_to_first_confirmed=self.first_confirmed_time,
             chains_built_from_confirmed=chains_valid,
             chains_with_unconfirmed=chains_invalid,
+            request_failures_total=intel.get_request_failure_summary().get('total_failures', 0) if intel else 0,
         )
 
     def _score_deterministic(
@@ -481,19 +487,27 @@ class EvalHarness:
         Validate chains against confirmed_urls.
         Valid = all finding_ids reference URLs that are confirmed.
         A chain is invalid if it has no finding_ids or any finding_id URL is unconfirmed.
+        URL comparison uses normalized exact match — no substring matching.
         """
+        from urllib.parse import urlunparse
+        def _norm(url: str) -> str:
+            try:
+                p = urlparse(url.strip().lower())
+                return urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), "", "", ""))
+            except Exception:
+                return url.strip().lower()
+
+        normalized_confirmed = {_norm(c) for c in confirmed_urls}
+
         valid   = 0
         invalid = 0
         for chain in chains:
             finding_ids = chain.get("finding_ids", [])
             if not finding_ids:
-                # No finding IDs — cannot validate, count as invalid
                 invalid += 1
                 continue
 
-            # Check attack_path steps for URL references
             attack_path = chain.get("attack_path", [])
-            # Extract any URLs mentioned in the attack path steps
             path_urls = []
             for step in attack_path:
                 import re
@@ -501,16 +515,12 @@ class EvalHarness:
                 path_urls.extend(urls)
 
             if path_urls:
-                # Validate against confirmed URLs
-                if all(any(confirmed in url for confirmed in confirmed_urls) or
-                       any(url in confirmed for confirmed in confirmed_urls)
+                if all(_norm(url) in normalized_confirmed
                        for url in path_urls):
                     valid += 1
                 else:
                     invalid += 1
             else:
-                # No URLs in path — validate by confidence
-                # HIGH = strong chain signal, MEDIUM/LOW = insufficient
                 if chain.get("confidence") == "HIGH":
                     valid += 1
                 else:
@@ -548,5 +558,6 @@ class EvalHarness:
                 "time_to_first_confirmed":  run.time_to_first_confirmed,
                 "chains_valid":             run.chains_built_from_confirmed,
                 "chains_invalid":           run.chains_with_unconfirmed,
+                "request_failures_total":   run.request_failures_total,
             }, f, indent=2)
         return str(path)

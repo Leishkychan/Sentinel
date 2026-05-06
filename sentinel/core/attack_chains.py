@@ -145,23 +145,6 @@ def analyze_attack_chains(result: ScanResult) -> list[AttackChain]:
     return chains
 
 
-def _serialize_findings(findings: list[Finding]) -> str:
-    """Serialize findings to a compact format for Claude's context."""
-    items = []
-    for f in findings:
-        items.append({
-            "id":          f.finding_id,
-            "severity":    f.severity,
-            "title":       f.title,
-            "description": f.description[:300],
-            "file":        f.file_path,
-            "agent":       f.agent,
-            "mitre":       f.mitre_tactic,
-            "cve":         f.cve_id,
-        })
-    return json.dumps(items, indent=2, default=str)
-
-
 def _serialize_findings_with_status(confirmed: list[Finding],
                                      inferred: list[Finding]) -> str:
     """

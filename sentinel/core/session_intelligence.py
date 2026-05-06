@@ -303,7 +303,7 @@ class SessionIntelligence:
         # Validate evidence before accepting CONFIRMED state
         ok, reason = evidence.is_sufficient_for_confirmation()
         if not ok:
-            print(f"[INTEL] ⚠ Cannot CONFIRM {url}: {reason} — downgrading to INCONCLUSIVE")
+            print(f"[INTEL] [WARN] Cannot CONFIRM {url}: {reason} -- downgrading to INCONCLUSIVE")
             return self.record_inconclusive(url, evidence, f"Evidence insufficient: {reason}")
 
         ep = EndpointRecord(
@@ -329,9 +329,8 @@ class SessionIntelligence:
         # CONFIRMED outranks all weaker states: remove from both
         self.disproven_urls.discard(url)
         self.inconclusive_urls.discard(url)
-        # ARCHITECTURAL NOTE: budget tracks classification events, not raw HTTP requests.
-        # With duplicate guards in place, this approximates request count (1 write per URL).
-        # True request count tracking requires instrumentation at the HTTP layer.
+        # budget_used tracks unique endpoint classification outcomes, not raw HTTP requests.
+        # One URL may require zero or many HTTP requests before it reaches CONFIRMED state.
         self.budget_used += 1
         # Remove from untested queue if present
         if url in self.untested_queue:
@@ -365,10 +364,10 @@ class SessionIntelligence:
             import sys
             harness = getattr(_eref, "current_harness", None)
             if harness is None:
-                print("[WARN] eval harness not set — time-to-confirm will not be recorded",
+                print("[WARN] eval harness not set -- time-to-confirm will not be recorded",
                       file=sys.stderr)
             elif not hasattr(harness, "record_first_confirmed"):
-                print("[WARN] eval harness missing record_first_confirmed — skipping",
+                print("[WARN] eval harness missing record_first_confirmed -- skipping",
                       file=sys.stderr)
             else:
                 harness.record_first_confirmed()
@@ -397,7 +396,7 @@ class SessionIntelligence:
                 # State integrity issue: in disproven_urls but not in endpoints
                 # Log and return None — do NOT fall through and create a new record.
                 # Falling through would re-increment budget_used and re-add to disproven_urls.
-                print(f"[INTEL] ⚠ State integrity: {url} in disproven_urls but missing from endpoints")
+                print(f"[INTEL] [WARN] State integrity: {url} in disproven_urls but missing from endpoints")
                 return None
             return ep
 
@@ -434,9 +433,8 @@ class SessionIntelligence:
         # Remove from queue — settled endpoints must not linger as pending work
         if url in self.untested_queue:
             self.untested_queue.remove(url)
-        # ARCHITECTURAL NOTE: budget tracks classification events, not raw HTTP requests.
-        # With duplicate guards in place, this approximates request count (1 write per URL).
-        # True request count tracking requires instrumentation at the HTTP layer.
+        # budget_used tracks unique endpoint classification outcomes, not raw HTTP requests.
+        # One URL may require zero or many HTTP requests before it reaches DISPROVEN state.
         self.budget_used += 1
         return ep
 
@@ -479,9 +477,8 @@ class SessionIntelligence:
         self.endpoints[url] = ep
         self.inconclusive_urls.add(url)
         self.inconclusive_counts[url] = self.inconclusive_counts.get(url, 0) + 1
-        # ARCHITECTURAL NOTE: budget tracks classification events, not raw HTTP requests.
-        # With duplicate guards in place, this approximates request count (1 write per URL).
-        # True request count tracking requires instrumentation at the HTTP layer.
+        # budget_used tracks unique endpoint classification outcomes, not raw HTTP requests.
+        # One URL may require zero or many HTTP requests before it reaches INCONCLUSIVE state.
         self.budget_used += 1
         return ep
 
@@ -583,7 +580,7 @@ class SessionIntelligence:
             "unauthenticated_admin": "Test admin functions with auth token for real impact scope",
             "no_rate_limiting":      "Send 10 rapid requests — verify no HTTP 429",
             "dangerous_methods":     "Test OPTIONS — confirm DELETE/PUT in Allow header",
-            "sql_injection":         "Test Boolean: append AND 1=1 vs AND 1=2 — different responses?",
+            "sql_injection":         "WSTG-INPV-05: Test boolean-based detection — compare server responses to logically equivalent vs inequivalent conditions",
             "sensitive_data_exposure": "Document all sensitive fields returned without auth",
         }.get(pattern, "Manual review required")
 
@@ -691,12 +688,6 @@ class SessionIntelligence:
             ("version-specific", "Version endpoint speculation — not confirmed in JS discovery"),
             ("version specific", "Version endpoint speculation — not confirmed in JS discovery"),
             ("api version", "Version endpoint speculation — not confirmed in JS discovery"),
-            ("v1/", "Version endpoint speculation — not confirmed in JS discovery"),
-            ("v2/", "Version endpoint speculation — not confirmed in JS discovery"),
-            ("v3/", "Version endpoint speculation — not confirmed in JS discovery"),
-            ("/api/v1", "Version endpoint speculation — not confirmed in JS discovery"),
-            ("/api/v2", "Version endpoint speculation — not confirmed in JS discovery"),
-            ("/rest/v1", "Version endpoint speculation — not confirmed in JS discovery"),
             ("older api", "Version endpoint speculation — not confirmed in JS discovery"),
             ("legacy endpoint", "Version endpoint speculation — not confirmed in JS discovery"),
         ]
@@ -704,19 +695,42 @@ class SessionIntelligence:
             if pattern in obj_lower:
                 return False, f"BLOCKED: {reason}"
 
-        # Don't investigate endpoints that were already refuted as SPA
+        # Version path block — only when combined with speculation language.
+        # Bare version paths (v1/, /api/v1) are NOT blocked because a target's
+        # real confirmed API may live at those paths. Only block when the objective
+        # uses guessing language ("try", "older", "legacy", "alternate", "previous")
+        # alongside a version path, which signals speculation rather than confirmed investigation.
+        _VERSION_PATHS = ("v1/", "v2/", "v3/", "/api/v1", "/api/v2", "/api/v3", "/rest/v1")
+        _SPECULATION   = ("try ", "try/", "older", "legacy", "alternate", "previous", "instead")
+        if (any(v in obj_lower for v in _VERSION_PATHS) and
+                any(s in obj_lower for s in _SPECULATION)):
+            return False, "BLOCKED: Version endpoint speculation — version path with guessing language"
+
+        def _norm_url(url: str) -> str:
+            """Strip query, fragment, trailing slash, lowercase — for exact URL comparison."""
+            try:
+                from urllib.parse import urlparse, urlunparse
+                p = urlparse(url.strip().lower())
+                return urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), "", "", ""))
+            except Exception:
+                return url.strip().lower()
+
+        # Don't investigate endpoints that were already refuted as SPA.
+        # Block only when the full normalized URL appears in the objective text —
+        # not on path fragment like "users" or "login".
         for url in self.disproven_urls:
-            url_part = url.split("/")[-1].lower()
             ep = self.endpoints.get(url)
             if (ep and hasattr(ep, 'disprove_reason') and
-                    ep.disprove_reason and 'SPA' in str(ep.disprove_reason) and
-                    url_part and url_part in obj_lower):
-                return False, f"BLOCKED: {url} was SPA — no server-side data"
+                    ep.disprove_reason and 'SPA' in str(ep.disprove_reason)):
+                norm = _norm_url(url)
+                if norm and norm in obj_lower:
+                    return False, f"BLOCKED: {url} was SPA — no server-side data"
 
-        # Don't investigate confirmed territory
+        # Don't investigate confirmed territory.
+        # Block only when the full normalized URL appears in the objective text.
         for url in self.confirmed_urls:
-            url_part = url.split("/")[-1].lower()
-            if url_part and len(url_part) > 3 and url_part in obj_lower:
+            norm = _norm_url(url)
+            if norm and norm in obj_lower:
                 return False, f"Already CONFIRMED: {url} — no need to reinvestigate"
 
         # Don't repeat completed objectives
@@ -903,7 +917,7 @@ class SessionIntelligence:
         """
         import sys
         detail = f"{failure_class}" + (f": {failure_reason[:80]}" if failure_reason else "")
-        print(f"[WARN] [{agent_name}] Request failed: {url} — {detail}",
+        print(f"[WARN] [{agent_name}] Request failed: {url} -- {detail}",
               file=sys.stderr)
 
         # Aggregate counter — (agent, failure_class) → count
@@ -953,7 +967,8 @@ class SessionIntelligence:
     def get_summary(self) -> dict:
         return {
             "session_id":            self.session_id,
-            "total_requests":        self.budget_used,
+            "total_requests":        self.budget_used,   # classified endpoint outcomes, not raw HTTP count
+            "budget_semantics":      "classified_endpoint_outcomes",
             "budget_remaining":      self.budget_total - self.budget_used,
             "confirmed":             len(self.confirmed_urls),
             "disproven":             len(self.disproven_urls),

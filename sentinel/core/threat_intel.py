@@ -32,6 +32,12 @@ CACHE_MAX_AGE_DAYS = 7
 # MITRE ATT&CK Enterprise JSON
 ATTACK_URL = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-attack/enterprise-attack.json"
 
+# Pinned SHA256 of the expected enterprise-attack.json.
+# Update this when MITRE releases a new ATT&CK version:
+#   curl -s <ATTACK_URL> | sha256sum
+# Hard block: mismatched hash means the file is never written or consumed.
+ATTACK_SHA256 = "17f5e624c5b41a357da654bd37fb92e563f40021809cf35d81730bb10011980e"
+
 # D3FEND API base
 DFEND_API = "https://d3fend.mitre.org/api/offensive-technique/attack"
 
@@ -188,11 +194,26 @@ def _cache_is_fresh() -> bool:
 
 
 def _download_and_cache() -> bool:
+    import hashlib
+    import sys
     try:
         resp = requests.get(ATTACK_URL, timeout=60)
         resp.raise_for_status()
+
+        # Integrity check — reject tampered or corrupted downloads
+        actual = hashlib.sha256(resp.content).hexdigest()
+        if actual != ATTACK_SHA256:
+            print(
+                f"[INTEL] INTEGRITY FAILURE: SHA256 mismatch on MITRE ATT&CK download.\n"
+                f"  Expected: {ATTACK_SHA256}\n"
+                f"  Got:      {actual}\n"
+                f"  File NOT cached. Update ATTACK_SHA256 in threat_intel.py if MITRE released a new version.",
+                file=sys.stderr,
+            )
+            return False
+
         ATTACK_CACHE.write_text(resp.text, encoding="utf-8")
-        print(f"[INTEL] ATT&CK downloaded ({len(resp.content) // 1024}KB)")
+        print(f"[INTEL] ATT&CK downloaded and verified ({len(resp.content) // 1024}KB)")
         return _load_from_cache()
     except Exception as e:
         print(f"[INTEL] Download failed: {e}. Using static MITRE mappings.")
