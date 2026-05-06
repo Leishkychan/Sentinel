@@ -27,7 +27,6 @@ sentinel/                          ← outer project root
     │   ├── nvd_lookup.py          ← NVD CVE API v2 lookup
     │   ├── audit.py               ← append-only JSONL audit log
     │   ├── auth_context.py        ← authentication context and JWT analysis
-    │   ├── consensus.py           ← multi-model consensus engine
     │   └── delta.py               ← cross-scan diffing and baseline comparison
     │
     ├── agents/                    ← all AI agents
@@ -54,7 +53,7 @@ sentinel/                          ← outer project root
     │   └── templates/index.html   ← dark terminal web UI
     │
     └── tests/
-        └── test_validator.py      ← safety layer tests (18 passing)
+        └── (no test files currently in repo)
 ```
 
 ## Data Flow
@@ -134,8 +133,10 @@ The AI proposes. The pipeline decides.
 The system explicitly records what was tested and found clean.
 
 ### 5. Standards-aware output
-Every finding maps to ASVS/WSTG.
-Output is audit-ready, not just informational.
+Findings are enriched with ASVS/WSTG references via best-effort keyword mapping.
+Coverage is partial — approximately 10 control families are mapped.
+Output includes structured `asvs_refs`, `wstg_refs`, and `control_family` fields
+when a match is found. Gaps exist for uncommon or framework-specific findings.
 
 ### 6. Policy over convention
 Policy gates are architectural, not guidelines.
@@ -145,27 +146,28 @@ Violations raise exceptions — they are never silently bypassed.
 
 ```
 Layer 1: Policy Gate (session-level)
-  - Initialized per scan
-  - Enforces method allowlists, payload classes, request budgets
-  - PolicyViolation exception raised on violation
+  - Initialized per scan via get_policy() in run_orchestrator
+  - Rate limits enforced at safe_request/probe_with_evidence via ContextVar
+  - PolicyViolation raised when per-endpoint or total budget exceeded
 
 Layer 2: Validator (action-level)
   - validate_action() called before every agent action
-  - HARDCODED_BLOCKS cannot be overridden by any mode
+  - HARDCODED_BLOCKS cannot be overridden by any mode or session
   - Mode permissions strictly enforced
+  - Payload-shape inspector blocks exploit-shaped requests at HTTP chokepoints
 
 Layer 3: Pipeline (finding-level)
   - Only OBSERVED+CONFIRMED findings become real findings
-  - SPA fallback always REFUTED
-  - 401/403 always REFUTED (auth enforced)
+  - SPA fallback classified as REFUTED
+  - Evidence required: real EvidenceRef from actual HTTP response
 
 Layer 4: Evidence requirement
-  - CONFIRMED requires proof snippet
-  - Blast radius measured, never estimated
+  - CONFIRMED requires proof_snippet (real response sample)
+  - is_sufficient_for_confirmation() must pass before state write
 
 Layer 5: Consent gate (scan-level)
   - session.approved must be True to proceed
-  - ACTIVE mode requires second typed confirmation
+  - ACTIVE mode requires second explicit confirmation
 ```
 
 ## Extending Sentinel
