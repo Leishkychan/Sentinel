@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 from anthropic import Anthropic
 from sentinel.core.models import (
     ScanMode, AgentName, ScanSession, Finding, Severity,
+    FindingType, DataSurfaceType,
 )
 from sentinel.core.evidence import probe_with_evidence, EvidenceArtifact, find_sensitive_fields_in_json
 from sentinel.core.pipeline import FindingPipeline, FindingState, NegativeValidation, PromotionRules
@@ -1002,6 +1003,10 @@ def _analyze_probe_response_with_evidence(url: str, resp,
     if state != FindingState.CONFIRMED:
         return []
 
+    # ── gate: evidence required before any finding is created ─────────────────
+    if evidence is None:
+        return []
+
     # Real data confirmed
     resource = url.rstrip("/").split("/")[-1].split("?")[0] or "endpoint"
 
@@ -1018,17 +1023,46 @@ def _analyze_probe_response_with_evidence(url: str, resp,
     if er.sample:
         desc_parts.append(f"Sample (sanitized): {er.sample}")
 
-    severity = Severity.CRITICAL if (er.sensitive_fields and er.record_count) else \
-               Severity.HIGH if (er.sensitive_fields or er.record_count) else \
-               Severity.MEDIUM
+    # ── normalize: deterministic severity matrix ──────────────────────────────
+    # Rule 1: sensitive fields AND records present → CRITICAL
+    # Rule 2: admin/config/management/internal context → CRITICAL
+    # Rule 3: sensitive fields OR records present → HIGH
+    # Rule 4: confirmed JSON/data, no sensitive fields → HIGH
+    # Rule 5: confirmed but no structured data → MEDIUM
+    # Size-based logic is explicitly excluded — context and content only.
+    _admin_context = any(
+        x in url.lower()
+        for x in ("admin", "config", "management", "internal", "system", "setup")
+    )
+    if er.sensitive_fields and er.record_count:
+        severity = Severity.CRITICAL
+    elif _admin_context:
+        severity = Severity.CRITICAL
+    elif er.sensitive_fields or er.record_count:
+        severity = Severity.HIGH
+    elif er.response_type == "JSON":
+        severity = Severity.HIGH
+    else:
+        severity = Severity.MEDIUM
+
+    # ── classify: finding_type is always VULNERABILITY for confirmed probes ───
+    # ── classify: data_surface_type — derivative if search/filter view ────────
+    _derivative_signals = ("/search", "/filter", "/query", "/lookup", "/find")
+    _data_surface = (
+        DataSurfaceType.DERIVATIVE
+        if any(s in url.lower() for s in _derivative_signals)
+        else DataSurfaceType.PRIMARY
+    )
 
     return [Finding(
         agent=AgentName.PROBE,
-        title=f"[Alpha] Confirmed Unauthenticated Access: /{resource}",
+        title=f"Unauthenticated Access: {url}",
         description=" ".join(desc_parts),
         severity=severity,
         file_path=url,
-        evidence=evidence,  # real EvidenceRef from pipeline — None if not CONFIRMED
+        evidence=evidence,
+        finding_type=FindingType.VULNERABILITY,
+        data_surface_type=_data_surface,
         mitre_tactic="Collection",
         mitre_technique="T1213 — Data from Information Repositories",
         remediation=(

@@ -39,6 +39,7 @@ from sentinel.core.session_intelligence import SessionIntelligence, DisproveReas
 from sentinel.core.models import (
     ScanMode, AgentName, ScanSession, Finding, ScanResult, Severity,
 )
+from sentinel.core.validator import HardStop
 
 _client = None
 
@@ -411,12 +412,18 @@ class QueenAgent:
             elif not url.startswith("http"):
                 url = base + "/" + url
             from sentinel.agents.alpha_agent import execute_targeted_probe
-            probe_findings = execute_targeted_probe(
-                {"url": url, "method": "GET",
-                 "hypothesis": objective.get("description", "")},
-                self.session
-            )
-            findings.extend(probe_findings)
+            import logging as _logging
+            try:
+                probe_findings = execute_targeted_probe(
+                    {"url": url, "method": "GET",
+                     "hypothesis": objective.get("description", "")},
+                    self.session
+                )
+                findings.extend(probe_findings)
+            except HardStop as e:
+                _logging.getLogger(__name__).warning(
+                    f"[QUEEN] HardStop — skipping {url}: {e}"
+                )
 
         return findings
 
