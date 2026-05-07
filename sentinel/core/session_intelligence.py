@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 from datetime import datetime, timezone
 from enum import Enum
-from sentinel.core.models import EvidenceRef  # defined in models.py — shared with Finding
+from sentinel.core.models import EvidenceRef, DataSurfaceType  # defined in models.py — shared with Finding
 
 
 # ── State definitions ─────────────────────────────────────────────────────────
@@ -93,11 +93,12 @@ class EndpointRecord:
     related_endpoints: list[str] = field(default_factory=list)
 
     def format_short(self) -> str:
-        icon = "✅" if self.outcome == ProbeOutcome.CONFIRMED else \
-               "❌" if self.outcome == ProbeOutcome.DISPROVEN else \
-               "🔍" if self.outcome == ProbeOutcome.INCONCLUSIVE else "❓"
+        icon = "[OK]"      if self.outcome == ProbeOutcome.CONFIRMED    else \
+               "[FAIL]"    if self.outcome == ProbeOutcome.DISPROVEN    else \
+               "[INFO]"    if self.outcome == ProbeOutcome.INCONCLUSIVE else \
+               "[UNKNOWN]"
         return (f"{icon} {self.url} [{self.outcome.value}] "
-                f"— {self.classification_reason[:60]}")
+                f"-- {self.classification_reason[:60]}")
 
     def format_full(self) -> str:
         lines = [
@@ -154,6 +155,11 @@ class RootCause:
     evidence_count: int = 0
     next_action: str = ""
     verified:    bool = False
+    # ── Phase 8: blast radius dedup fields ────────────────────────────────────
+    aggregate_record_count:  Optional[int]  = None   # sum of PRIMARY endpoints only
+    aggregate_bytes:         Optional[int]  = None   # sum of PRIMARY endpoints only
+    response_signatures:     list[str]      = field(default_factory=list)  # sha256 of proof_snippets seen
+    data_surface_breakdown:  dict           = field(default_factory=dict)  # url → "PRIMARY"|"DERIVATIVE"
 
 
 # ── Session Intelligence ──────────────────────────────────────────────────────
@@ -530,29 +536,130 @@ class SessionIntelligence:
     # ── Root cause grouping ───────────────────────────────────────────────────
 
     def _update_root_cause(self, url: str, evidence: EvidenceRef):
-        """Group confirmed findings by root cause pattern."""
+        """
+        Authoritative root cause grouping — Phase 8.
+
+        Dedup key: (normalize_url(url), vulnerability_class_pattern)
+        DataSurfaceType classification:
+          1. Canonical dataset key match (explicit map) — PRIMARY/DERIVATIVE
+          2. Response signature hash fallback (sha256 of proof_snippet[:200])
+        Blast radius dedup: aggregate record_count from PRIMARY endpoints only.
+        Severity elevation: admin/config context → CRITICAL unconditionally.
+        """
+        import hashlib
+
         # Infer pattern from evidence
         if evidence.sensitive_fields:
-            pattern = "sensitive_data_exposure"
+            pattern  = "sensitive_data_exposure"
             category = "Sensitive Data Protection"
             severity = "HIGH"
         elif not evidence.auth_sent and evidence.status_code == 200:
-            pattern = "unauthenticated_api"
+            pattern  = "unauthenticated_api"
             category = "Authorization / Access Control"
             severity = "HIGH"
         else:
             return
 
-        # Find or create root cause
+        # ── normalize: admin/config context always elevates to CRITICAL ───────
+        _admin_signals = ("admin", "config", "management", "internal", "system", "setup")
+        if any(s in url.lower() for s in _admin_signals):
+            severity = "CRITICAL"
+
+        # ── canonical dataset map ─────────────────────────────────────────────
+        # Maps URL path substrings → canonical dataset key.
+        # First endpoint matching a key = PRIMARY; subsequent = DERIVATIVE.
+        # Extend this map as new targets are scanned.
+        CANONICAL_DATASETS: dict[str, str] = {
+            "/api/products":          "products",
+            "/rest/products/search":  "products",
+            "/rest/products/":        "products",
+            "/api/feedbacks":         "feedbacks",
+            "/rest/feedbacks":        "feedbacks",
+            "/api/users":             "users",
+            "/rest/users":            "users",
+            "/api/challenges":        "challenges",
+            "/api/quantitys":         "quantities",
+            "/api/quantities":        "quantities",
+            "/api/orders":            "orders",
+            "/rest/orders":           "orders",
+            "/api/complaints":        "complaints",
+            "/api/baskets":           "baskets",
+        }
+
+        def _norm(u: str) -> str:
+            try:
+                from urllib.parse import urlparse, urlunparse
+                p = urlparse(u.strip().lower())
+                return urlunparse((p.scheme, p.netloc, p.path.rstrip("/"), "", "", ""))
+            except Exception:
+                return u.strip().lower()
+
+        url_lower = url.lower()
+        dataset_key = next(
+            (dk for path_fragment, dk in CANONICAL_DATASETS.items()
+             if path_fragment in url_lower),
+            None
+        )
+
+        # ── dedup key: (normalized_url, pattern) ─────────────────────────────
+        dedup_key = (_norm(url), pattern)
+
+        # Reject if this exact (url, pattern) pair is already registered
         for rc in self.root_causes:
-            if rc.pattern == pattern and url not in rc.endpoints:
+            if rc.pattern == pattern:
+                for ep_url in rc.endpoints:
+                    if (_norm(ep_url), pattern) == dedup_key:
+                        return  # already grouped — idempotent
+
+        # ── response signature fallback (hash-based) ──────────────────────────
+        proof = getattr(evidence, "proof_snippet", None) or ""
+        sig   = hashlib.sha256(proof[:200].encode("utf-8", errors="replace")).hexdigest()[:16]
+        if not proof:
+            sig = hashlib.sha256(
+                f"{url}:{evidence.record_count}:{evidence.size_bytes}".encode()
+            ).hexdigest()[:16]
+
+        # ── group: find existing root cause for this pattern ──────────────────
+        for rc in self.root_causes:
+            if rc.pattern == pattern:
+                # Determine surface type:
+                # 1. Canonical key match → DERIVATIVE if key already seen
+                # 2. Hash match → DERIVATIVE
+                # 3. Otherwise → PRIMARY
+                rc_dataset_keys = set(
+                    rc.data_surface_breakdown.get("_dataset_keys_seen", "").split(",")
+                )
+                rc_dataset_keys.discard("")
+
+                if dataset_key and dataset_key in rc_dataset_keys:
+                    surface = DataSurfaceType.DERIVATIVE.value
+                elif dataset_key is None and sig in rc.response_signatures:
+                    surface = DataSurfaceType.DERIVATIVE.value
+                else:
+                    surface = DataSurfaceType.PRIMARY.value
+                    rc.response_signatures.append(sig)
+                    if dataset_key:
+                        rc_dataset_keys.add(dataset_key)
+                        rc.data_surface_breakdown["_dataset_keys_seen"] = ",".join(rc_dataset_keys)
+                    # Aggregate only PRIMARY endpoints
+                    if evidence.record_count is not None:
+                        rc.aggregate_record_count = (rc.aggregate_record_count or 0) + evidence.record_count
+                    if evidence.size_bytes:
+                        rc.aggregate_bytes = (rc.aggregate_bytes or 0) + evidence.size_bytes
+
                 rc.endpoints.append(url)
                 rc.evidence_count += 1
                 rc.verified = True
+                rc.data_surface_breakdown[url] = surface
+                # Elevate severity if this endpoint is admin context
+                if severity == "CRITICAL":
+                    rc.severity = "CRITICAL"
                 return
 
+        # ── group: create new root cause ──────────────────────────────────────
         rc_id = f"RC-{len(self.root_causes)+1:03d}"
-        self.root_causes.append(RootCause(
+        initial_dataset_keys = dataset_key or ""
+        new_rc = RootCause(
             root_id=rc_id,
             title=self._pattern_to_title(pattern),
             category=category,
@@ -562,7 +669,15 @@ class SessionIntelligence:
             evidence_count=1,
             next_action=self._get_next_action(pattern),
             verified=True,
-        ))
+            aggregate_record_count=evidence.record_count if evidence.record_count is not None else None,
+            aggregate_bytes=evidence.size_bytes or None,
+            response_signatures=[sig],
+            data_surface_breakdown={
+                url: DataSurfaceType.PRIMARY.value,
+                "_dataset_keys_seen": initial_dataset_keys,
+            },
+        )
+        self.root_causes.append(new_rc)
 
     def _pattern_to_title(self, pattern: str) -> str:
         return {

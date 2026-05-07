@@ -36,7 +36,7 @@ ATTACK_URL = "https://raw.githubusercontent.com/mitre/cti/master/enterprise-atta
 # Update this when MITRE releases a new ATT&CK version:
 #   curl -s <ATTACK_URL> | sha256sum
 # Hard block: mismatched hash means the file is never written or consumed.
-ATTACK_SHA256 = "17f5e624c5b41a357da654bd37fb92e563f40021809cf35d81730bb10011980e"
+ATTACK_SHA256 = "987d0cfddb1e65797457cf2b045df9161140ede71fd627f15dfdd73c2a2c72ab"
 
 # D3FEND API base
 DFEND_API = "https://d3fend.mitre.org/api/offensive-technique/attack"

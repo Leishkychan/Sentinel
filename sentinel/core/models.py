@@ -29,6 +29,23 @@ class Severity(str, Enum):
     INFO     = "INFO"
 
 
+# ── Finding Type ─────────────────────────────────────────────────────────────
+
+class FindingType(str, Enum):
+    VULNERABILITY = "VULNERABILITY"  # Exploitable flaw — evidence required
+    EXPOSURE      = "EXPOSURE"       # Configuration choice with attack surface implications
+    OBSERVATION   = "OBSERVATION"    # Informational — no action required
+    META          = "META"           # Internal agent output — never in findings sections
+
+
+# ── Data Surface Type ─────────────────────────────────────────────────────────
+
+class DataSurfaceType(str, Enum):
+    PRIMARY    = "PRIMARY"    # Canonical data source
+    DERIVATIVE = "DERIVATIVE" # Derived view of a PRIMARY dataset
+    UNKNOWN    = "UNKNOWN"    # Not yet classified
+
+
 # ── Agent Names ───────────────────────────────────────────────────────────────
 
 class AgentName(str, Enum):
@@ -152,6 +169,8 @@ class Finding(BaseModel):
     asvs_refs:    list[str]          = Field(default_factory=list)   # Structured ASVS references
     wstg_refs:    list[str]          = Field(default_factory=list)   # Structured WSTG references
     control_family: Optional[str]   = None                           # OWASP control family
+    finding_type:   Optional[FindingType]      = None                # classify stage
+    data_surface_type: Optional[DataSurfaceType] = None              # dedup/group stage
     timestamp:    datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
